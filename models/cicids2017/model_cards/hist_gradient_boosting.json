@@ -1,0 +1,17 @@
+{
+  "model_id": "hist_gradient_boosting_cicids2017",
+  "name": "Hist Gradient Boosting",
+  "dataset": "CICIDS2017",
+  "framework": "scikit-learn",
+  "file_path": "models/cicids2017/hist_gradient_boosting_cicids2017.pkl",
+  "feature_count": 77,
+  "classes_count": 15,
+  "metrics": {
+    "accuracy": 0.991556,
+    "precision": 0.995898,
+    "recall": 0.991556,
+    "f1_score": 0.993635,
+    "training_time_seconds": 37.39
+  },
+  "supports_shap": false
+}

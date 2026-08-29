@@ -1,0 +1,17 @@
+{
+  "model_id": "mlp_classifier_cicids2017",
+  "name": "MLP Classifier (Neural Net)",
+  "dataset": "CICIDS2017",
+  "framework": "scikit-learn",
+  "file_path": "models/cicids2017/mlp_classifier_cicids2017.pkl",
+  "feature_count": 77,
+  "classes_count": 15,
+  "metrics": {
+    "accuracy": 0.996545,
+    "precision": 0.996538,
+    "recall": 0.996545,
+    "f1_score": 0.99612,
+    "training_time_seconds": 1981.1
+  },
+  "supports_shap": false
+}

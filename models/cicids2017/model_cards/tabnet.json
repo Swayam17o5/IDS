@@ -1,0 +1,17 @@
+{
+  "model_id": "tabnet_cicids2017",
+  "name": "TabNet Attention Model",
+  "dataset": "CICIDS2017",
+  "framework": "pytorch-tabnet",
+  "file_path": "models/cicids2017/tabnet_cicids2017.zip",
+  "feature_count": 77,
+  "classes_count": 15,
+  "metrics": {
+    "accuracy": 0.951441,
+    "precision": 0.96035,
+    "recall": 0.951441,
+    "f1_score": 0.952951,
+    "training_time_seconds": 1213.5
+  },
+  "supports_shap": false
+}

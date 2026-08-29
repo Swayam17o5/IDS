@@ -1,0 +1,17 @@
+{
+  "model_id": "ft_transformer_cicids2017",
+  "name": "FT-Transformer",
+  "dataset": "CICIDS2017",
+  "framework": "pytorch/rtdl",
+  "file_path": "models/cicids2017/ft_transformer_cicids2017.pth",
+  "feature_count": 77,
+  "classes_count": 15,
+  "metrics": {
+    "accuracy": 0.964034,
+    "precision": 0.961708,
+    "recall": 0.964034,
+    "f1_score": 0.961841,
+    "training_time_seconds": 10716.78
+  },
+  "supports_shap": false
+}

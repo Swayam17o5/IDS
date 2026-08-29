@@ -1,0 +1,17 @@
+{
+  "model_id": "lightgbm_cicids2017",
+  "name": "LightGBM Classifier",
+  "dataset": "CICIDS2017",
+  "framework": "lightgbm",
+  "file_path": "models/cicids2017/lightgbm_cicids2017.pkl",
+  "feature_count": 77,
+  "classes_count": 15,
+  "metrics": {
+    "accuracy": 0.893739,
+    "precision": 0.899590,
+    "recall": 0.893739,
+    "f1_score": 0.879898,
+    "training_time_seconds": 290.37
+  },
+  "supports_shap": true
+}

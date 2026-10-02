@@ -12,9 +12,14 @@ def test_health_endpoint(client):
     res = client.get("/health")
     assert res.status_code == 200
     data = res.json()
-    assert data["status"] == "ok"
+    # Phase 1: status is 'healthy' (was 'ok' in Phase 0)
+    assert data["status"] in ("healthy", "degraded")
     assert "xgboost" in data["loaded_models"]
     assert "weighted_voting_ensemble" in data["loaded_models"] or "stacking_ensemble" in data["loaded_models"]
+    # Phase 1: additional component health fields
+    assert data["feature_count"] == 77
+    assert "components" in data
+    assert data["model_loaded"] is True
 
 def test_models_registry_endpoint(client):
     res = client.get("/models")

@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "description": "Centralized severity configuration for CICIDS2017 attack classes. Edit this file to change severity levels. Do not hardcode severity in application code.",
+  "default_severity": "MEDIUM",
+  "severity_levels": ["NONE", "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+  "attack_severities": {
+    "Benign":                      "NONE",
+    "DDoS":                        "CRITICAL",
+    "Heartbleed":                  "CRITICAL",
+    "Infiltration":                "CRITICAL",
+    "DoS Hulk":                    "HIGH",
+    "DoS GoldenEye":               "HIGH",
+    "DoS Slowhttptest":            "HIGH",
+    "DoS slowloris":               "HIGH",
+    "Web Attack - Sql Injection":  "HIGH",
+    "Bot":                         "MEDIUM",
+    "PortScan":                    "MEDIUM",
+    "SSH-Patator":                 "MEDIUM",
+    "FTP-Patator":                 "MEDIUM",
+    "Web Attack - Brute Force":    "MEDIUM",
+    "Web Attack - XSS":            "MEDIUM"
+  },
+  "thresholds": {
+    "min_confidence_for_alert": 0.80,
+    "dedup_window_seconds": 120
+  }
+}

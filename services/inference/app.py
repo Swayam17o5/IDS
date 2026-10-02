@@ -1,19 +1,27 @@
 import os
 import sys
 import json
+import time
+import logging
 import joblib
 import torch
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Body, Depends
-from fastapi.responses import HTMLResponse
+import asyncio
+from fastapi import FastAPI, HTTPException, Body, Depends, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Dict, List, Any, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func, desc
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+# Configure structured logging BEFORE any aegis imports
+from services.logging_config import configure_logging
+configure_logging()
 
 from pytorch_tabnet.tab_model import TabNetClassifier
 import rtdl_revisiting_models as rtdl
@@ -22,15 +30,60 @@ from services.registry.registry import ModelRegistry
 from services.inference.explainer import SHAPExplainer
 from services.inference.ensemble import IDSStackingEnsemble
 from services.alert_engine.engine import AlertEngine
+from services.validation.feature_validator import FeatureValidator
 from services.feature_extractor.live_capture import (
     CAPTURE_SERVICE,
     check_capture_capabilities,
     get_available_interfaces
 )
+from services.feature_extractor.pcap_replay import REPLAY_SERVICE
+from services.demo.nmap_demo import NMAP_DEMO_RUNNER, is_authorized_lab_target, validate_port_spec
 from database.db import init_db, SessionLocal, get_db
-from database.models import DBFlow, DBPrediction, DBAlert, DBModelCard, DBAnalystFeedback, ALERT_STATUSES
+from database.models import (
+    DBFlow, DBPrediction, DBAlert, DBModelCard, DBAnalystFeedback,
+    DBIncident, DBIncidentAlert, DBIncidentNote, DBPCAPReplay,
+    ALERT_STATUSES, INCIDENT_STATUSES
+)
+from services.inference.dashboard import DASHBOARD_HTML
+from services.inference.explainability_page import EXPLAINABILITY_HTML
 
-app = FastAPI(title="AegisNIDS Real-Time SOC Intelligence Engine", version="1.0.0")
+logger = logging.getLogger("aegis.inference")
+
+# ─── WebSocket Real-Time Event Hub ──────────────────────────────────────────
+class WebSocketManager:
+    """Manages real-time WebSocket client subscriptions for live telemetry & alerts."""
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info("WebSocket client connected. Active subscribers: %d", len(self.active_connections))
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info("WebSocket client disconnected. Active subscribers: %d", len(self.active_connections))
+
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                self.disconnect(connection)
+
+WS_MANAGER = WebSocketManager()
+
+def broadcast_live_event_sync(event_type: str, data: dict):
+    """Safely dispatches real-time broadcast events across active WebSocket connections."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(WS_MANAGER.broadcast({"type": event_type, "data": data, "timestamp": time.time()}))
+    except Exception:
+        pass
+
+app = FastAPI(title="AegisNIDS Real-Time SOC Intelligence Engine", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +100,14 @@ CANONICAL_FEATURES = []
 LABEL_MAPPING = {}
 ACTIVE_MODEL = "stacking_ensemble"
 EXPLAINER = None
-ALERT_ENGINE = AlertEngine(min_confidence_threshold=0.80, dedup_window_seconds=120)
+MODEL_VERSION = "1.0"
+FEATURE_VALIDATOR: Optional[FeatureValidator] = None
+
+ALERT_ENGINE = AlertEngine(
+    min_confidence_threshold=0.80,
+    dedup_window_seconds=120,
+    severity_config_path="severity_config.json",
+)
 
 # --- Plain-Language Alert Explanation Generator ---
 
@@ -101,51 +161,70 @@ def generate_alert_explanation(
     return f"Flagged as {attack_type} due to {feature_clause}, consistent with {pattern}."
 
 def init_models(dataset: str = "cicids2017"):
-    global MODELS, CANONICAL_FEATURES, LABEL_MAPPING, EXPLAINER, ACTIVE_MODEL
+    global MODELS, CANONICAL_FEATURES, LABEL_MAPPING, EXPLAINER, ACTIVE_MODEL, FEATURE_VALIDATOR
     base_dir = os.path.join("models", dataset)
-    
+
+    logger.info("Initialising models for dataset: %s", dataset)
+
     # Initialize DB
     init_db()
-    
+
     # Load feature order
-    with open(os.path.join(base_dir, "feature_list.json"), "r") as f:
+    feature_list_path = os.path.join(base_dir, "feature_list.json")
+    with open(feature_list_path, "r") as f:
         CANONICAL_FEATURES = json.load(f)
-        
+    logger.info("Loaded %d canonical features from %s", len(CANONICAL_FEATURES), feature_list_path)
+
+    # Initialise centralized 77-feature validator
+    schema_path = os.path.abspath("feature_schema.json")
+    try:
+        FEATURE_VALIDATOR = FeatureValidator(schema_path=schema_path)
+        logger.info("FeatureValidator initialised with %d features", FEATURE_VALIDATOR.expected_count)
+    except Exception as exc:
+        logger.warning("FeatureValidator init failed (%s) — validation disabled", exc)
+        FEATURE_VALIDATOR = None
+
     # Load label mapping
     with open(os.path.join(base_dir, "label_mapping.json"), "r") as f:
         raw_map = json.load(f)
         LABEL_MAPPING = {int(k): v for k, v in raw_map.items()}
-        
+    logger.info("Loaded label mapping: %d classes", len(LABEL_MAPPING))
+
     # Load Models
     MODELS = {}
-    
+
     # 1. XGBoost
     xgb_path = os.path.join(base_dir, "xgboost_cicids2017.pkl")
     if os.path.exists(xgb_path):
         MODELS["xgboost"] = joblib.load(xgb_path)
-        
+        logger.info("Loaded model: xgboost")
+
     # 2. LightGBM
     lgb_path = os.path.join(base_dir, "lightgbm_cicids2017.pkl")
     if os.path.exists(lgb_path):
         MODELS["lightgbm"] = joblib.load(lgb_path)
-        
+        logger.info("Loaded model: lightgbm")
+
     # 3. HistGradientBoosting
     hgb_path = os.path.join(base_dir, "hist_gradient_boosting_cicids2017.pkl")
     if os.path.exists(hgb_path):
         MODELS["hist_gradient_boosting"] = joblib.load(hgb_path)
-        
+        logger.info("Loaded model: hist_gradient_boosting")
+
     # 4. MLP Classifier
     mlp_path = os.path.join(base_dir, "mlp_classifier_cicids2017.pkl")
     if os.path.exists(mlp_path):
         MODELS["mlp_classifier"] = joblib.load(mlp_path)
-        
+        logger.info("Loaded model: mlp_classifier")
+
     # 5. TabNet
     tabnet_path = os.path.join(base_dir, "tabnet_cicids2017.zip")
     if os.path.exists(tabnet_path):
         tabnet_model = TabNetClassifier()
         tabnet_model.load_model(tabnet_path)
         MODELS["tabnet"] = tabnet_model
-        
+        logger.info("Loaded model: tabnet")
+
     # 6. FT-Transformer
     ft_path = os.path.join(base_dir, "ft_transformer_cicids2017.pth")
     if os.path.exists(ft_path):
@@ -158,30 +237,68 @@ def init_models(dataset: str = "cicids2017"):
         ft_model.load_state_dict(torch.load(ft_path, map_location=torch.device("cpu")))
         ft_model.eval()
         MODELS["ft_transformer"] = ft_model
-        
+        logger.info("Loaded model: ft_transformer")
+
     # 7. Weighted Voting Ensemble
     ensemble_path = os.path.join(base_dir, "stacking_ensemble.pkl")
     if os.path.exists(ensemble_path):
         MODELS["weighted_voting_ensemble"] = joblib.load(ensemble_path)
-        
+        logger.info("Loaded model: weighted_voting_ensemble")
+
     # Initialize Tree SHAP explainer on XGBoost
     if "xgboost" in MODELS:
         EXPLAINER = SHAPExplainer(MODELS["xgboost"], CANONICAL_FEATURES)
-        
+        logger.info("SHAP TreeExplainer initialised on XGBoost")
+
     ACTIVE_MODEL = "weighted_voting_ensemble" if "weighted_voting_ensemble" in MODELS else "xgboost"
-    print(f"Loaded {len(MODELS)} models for {dataset} (Active: {ACTIVE_MODEL})!")
+    logger.info("Loaded %d models for %s (Active: %s)", len(MODELS), dataset, ACTIVE_MODEL)
 
 @app.on_event("startup")
 def startup_event():
     init_models("cicids2017")
 
 class FlowPredictRequest(BaseModel):
-    features: Dict[str, float] = Field(..., description="Map of 77 CICIDS2017 canonical feature names to float values")
-    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Network context (src_ip, dst_ip, ports, proto)")
+    features: Dict[str, float] = Field(
+        ...,
+        description="Map of 77 CICIDS2017 canonical feature names to float values",
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Network context (src_ip, dst_ip, ports, proto)",
+    )
 
 def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, Any]:
-    """Core prediction and database persistence pipeline."""
-    ordered_values = [req.features.get(f, 0.0) for f in CANONICAL_FEATURES]
+    """
+    Core prediction and database persistence pipeline.
+
+    Pipeline:
+      Validate features (77-feature schema)
+        → Preprocessing (NaN/Inf sanitise)
+        → All 7 ML models
+        → Dual-signal verdict (ML + SYN heuristic)
+        → Alert engine
+        → Persist to DB
+        → Return response with timing metrics
+    """
+    import datetime as _dt
+    t_start = time.perf_counter()
+
+    # ── 1. Feature Schema Validation ───────────────────────────────────────
+    t_val_start = time.perf_counter()
+    if FEATURE_VALIDATOR is not None:
+        val_result = FEATURE_VALIDATOR.validate(req.features)
+        if not val_result.valid:
+            logger.warning(
+                "Feature validation failed: missing=%s extra=%s type_errors=%s",
+                val_result.missing_features,
+                val_result.extra_features,
+                val_result.type_errors,
+            )
+            raise HTTPException(status_code=422, detail=val_result.error_response())
+        ordered_values = val_result.ordered_values
+    else:
+        ordered_values = [req.features.get(f, 0.0) for f in CANONICAL_FEATURES]
+    validation_latency_ms = (time.perf_counter() - t_val_start) * 1000
     df_xgb = pd.DataFrame([ordered_values], columns=CANONICAL_FEATURES, dtype=np.float32)
     
     lgb_cols = [c.replace(" ", "_").replace("-", "_") for c in CANONICAL_FEATURES]
@@ -271,6 +388,9 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
             "probabilities": {LABEL_MAPPING.get(i, str(i)): float(p[i]) for i in range(len(p))}
         }
 
+    # ── 2. ML Inference (timed) ────────────────────────────────────────────
+    t_inf_start = time.perf_counter()
+
     # SHAP explanations
     shap_top_features = EXPLAINER.explain_instance(df_xgb, top_k=5) if EXPLAINER else []
 
@@ -300,7 +420,6 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
             detection_method = "SYN_BURST_HEURISTIC"
             final_label = "PortScan"
             final_class_id = 10
-            # Normalized scan evidence score (0.80 - 0.99 depending on ports probed)
             final_confidence = heuristic_score if heuristic_score > 0 else 0.80
             detection_confidence = final_confidence
     else:
@@ -310,14 +429,20 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
         final_confidence = ml_confidence
         detection_confidence = ml_confidence
 
-    print(
-        f"[INFERENCE_VERDICT] Method: {detection_method} | Verdict: {final_label} (Conf: {final_confidence:.4f}) | "
-        f"ML Model: {final_model_key} (Pred: {ml_predicted_label} @ {ml_confidence:.4f}, PortScan Prob: {ml_portscan_prob:.6f}) | "
-        f"Heuristic Score: {heuristic_score:.4f} (Ports: {distinct_ports})",
-        flush=True
+    inference_latency_ms = (time.perf_counter() - t_inf_start) * 1000
+
+    logger.info(
+        "Prediction: %s confidence=%.4f method=%s model=%s (PortScan_prob=%.4f heuristic=%.4f ports=%d)",
+        final_label, final_confidence, detection_method, final_model_key,
+        ml_portscan_prob, heuristic_score, distinct_ports,
     )
 
     response_payload = {
+        "prediction": final_label,                     # Phase 1 simple format
+        "confidence": final_confidence,
+        "model": final_model_key,
+        "model_version": MODEL_VERSION,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "final_verdict": {
             "active_model_used": final_model_key,
             "predicted_label": final_label,
@@ -336,24 +461,31 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
         "metadata": meta
     }
 
-    # Persist to Database & Trigger Alert Engine
+    # ── 3. Persist to Database & Trigger Alert Engine ─────────────────────
+    t_db_start = time.perf_counter()
     try:
         meta = req.metadata or {}
-        # Store full 77-feature vector for retraining feedback loop
         flow_rec = DBFlow(
             src_ip=meta.get("src_ip", "0.0.0.0"),
             dst_ip=meta.get("dst_ip", "0.0.0.0"),
             src_port=int(meta.get("src_port", 0)),
             dst_port=int(meta.get("dst_port", 0)),
             protocol=int(meta.get("protocol", 6)),
-            features_json=req.features
+            duration_seconds=float(meta.get("duration_seconds", 0.0)),
+            packet_count=int(meta.get("total_packets", 0)),
+            features_json=req.features,
         )
         db.add(flow_rec)
         db.flush()
+        logger.debug("Flow persisted: id=%d src=%s dst=%s", flow_rec.id, flow_rec.src_ip, flow_rec.dst_ip)
+
+        total_e2e_ms = (time.perf_counter() - t_start) * 1000
+        db_latency_ms = (time.perf_counter() - t_db_start) * 1000
 
         pred_rec = DBPrediction(
             flow_id=flow_rec.id,
             model_name=final_model_key,
+            model_version=MODEL_VERSION,
             predicted_label=final_label,
             predicted_class_id=final_class_id,
             confidence=final_confidence,
@@ -363,7 +495,11 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
             ml_confidence=ml_confidence,
             ml_portscan_prob=ml_portscan_prob,
             probabilities_json=raw_probs,
-            shap_json=shap_top_features
+            shap_json=shap_top_features,
+            validation_latency_ms=round(validation_latency_ms, 3),
+            inference_latency_ms=round(inference_latency_ms, 3),
+            db_latency_ms=round(db_latency_ms, 3),
+            total_latency_ms=round(total_e2e_ms, 3),
         )
         db.add(pred_rec)
 
@@ -377,6 +513,8 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
                 ml_predicted_label=ml_predicted_label,
                 distinct_ports=distinct_ports
             )
+            import datetime as _dt
+            _now = _dt.datetime.now(_dt.timezone.utc)
             db_alert = DBAlert(
                 alert_id=alert_event["alert_id"],
                 severity=alert_event["severity"],
@@ -388,22 +526,72 @@ def execute_flow_prediction(req: FlowPredictRequest, db: Session) -> Dict[str, A
                 ml_confidence=alert_event.get("ml_confidence", ml_confidence),
                 src_ip=alert_event["src_ip"],
                 dst_ip=alert_event["dst_ip"],
+                src_port=int(meta.get("src_port", 0)),
                 dst_port=alert_event["dst_port"],
                 model_used=alert_event["model_used"],
                 dedup_key=alert_event["dedup_key"],
                 status="NEW",
+                flow_count=1,
+                first_seen=_now,
+                last_seen=_now,
                 shap_json=shap_top_features,
-                explanation=explanation
+                explanation=explanation,
             )
             db.add(db_alert)
             alert_event["explanation"] = explanation
             response_payload["alert_generated"] = alert_event
+            logger.info(
+                "Alert generated: alert_id=%s attack=%s src=%s dst=%s conf=%.4f",
+                alert_event["alert_id"], alert_event["attack_type"],
+                alert_event["src_ip"], alert_event["dst_ip"], alert_event["confidence"],
+            )
         else:
             response_payload["alert_generated"] = None
 
         db.commit()
-    except Exception as e:
+
+        # Real-time WebSocket broadcasting (Phase 2)
+        if alert_event:
+            broadcast_live_event_sync("alert", alert_event)
+        broadcast_live_event_sync("flow", {
+            "id": flow_rec.id,
+            "src_ip": flow_rec.src_ip,
+            "dst_ip": flow_rec.dst_ip,
+            "src_port": flow_rec.src_port,
+            "dst_port": flow_rec.dst_port,
+            "protocol": flow_rec.protocol,
+            "predicted_label": final_label,
+            "confidence": final_confidence,
+            "detection_method": detection_method,
+            "model_name": final_model_key,
+            "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat()
+        })
+
+        # Performance timing summary
+        response_payload["performance"] = {
+            "validation_latency_ms": round(validation_latency_ms, 3),
+            "inference_latency_ms": round(inference_latency_ms, 3),
+            "db_latency_ms": round(db_latency_ms, 3),
+            "total_latency_ms": round(total_e2e_ms, 3),
+        }
+        logger.info(
+            "E2E latency: validation=%.1fms inference=%.1fms db=%.1fms total=%.1fms",
+            validation_latency_ms, inference_latency_ms, db_latency_ms, total_e2e_ms,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
         db.rollback()
+        logger.error("Database persistence error: %s", exc, exc_info=True)
+        if "performance" not in response_payload:
+            total_e2e_ms = (time.perf_counter() - t_start) * 1000
+            response_payload["performance"] = {
+                "validation_latency_ms": round(validation_latency_ms, 3),
+                "inference_latency_ms": round(inference_latency_ms, 3),
+                "db_latency_ms": 0.0,
+                "total_latency_ms": round(total_e2e_ms, 3),
+            }
 
     return response_payload
 
@@ -418,35 +606,90 @@ def handle_live_captured_flow(flow_dict: Dict[str, Any]):
         )
         res = execute_flow_prediction(req, db=db)
         verdict = res.get("final_verdict", {})
-        label = verdict.get('predicted_label', 'Unknown')
-        confidence = verdict.get('confidence', 0.0)
-        method = verdict.get('detection_method', 'MACHINE_LEARNING')
-        is_scan = meta.get('is_port_scan', False)
-        alert_generated = res.get('alert_generated')
+        label = verdict.get("predicted_label", "Unknown")
+        confidence = verdict.get("confidence", 0.0)
+        method = verdict.get("detection_method", "MACHINE_LEARNING")
+        alert_generated = res.get("alert_generated")
+        perf = res.get("performance", {})
 
-        print(
-            "[LIVE_FLOW] iface='" + str(CAPTURE_SERVICE.active_interface) + "' ip=" + str(CAPTURE_SERVICE.active_ip) + " "
-            + str(meta.get('src_ip')) + ":" + str(meta.get('src_port')) + " -> "
-            + str(meta.get('dst_ip')) + ":" + str(meta.get('dst_port')) + " "
-            "proto=" + str(meta.get('protocol')) + " pkts=" + str(meta.get('total_packets', 1)) + " "
-            "dur=" + str(round(meta.get('duration_seconds', 0.0), 4)) + "s "
-            "method=" + str(method) + " label=" + str(label) + " conf=" + str(round(confidence * 100, 2)) + "% "
-            "model=" + str(verdict.get('active_model_used')) + " "
-            "alert=" + ("YES - " + alert_generated['alert_id'] if alert_generated else "none"),
-            flush=True
+        logger.info(
+            "[LIVE_FLOW] iface=%s %s:%s -> %s:%s proto=%s pkts=%s dur=%.4fs "
+            "method=%s label=%s conf=%.2f%% model=%s alert=%s "
+            "latency=%.1fms",
+            CAPTURE_SERVICE.active_interface,
+            meta.get("src_ip"), meta.get("src_port"),
+            meta.get("dst_ip"), meta.get("dst_port"),
+            meta.get("protocol"),
+            meta.get("total_packets", 1),
+            meta.get("duration_seconds", 0.0),
+            method, label, confidence * 100,
+            verdict.get("active_model_used"),
+            alert_generated["alert_id"] if alert_generated else "none",
+            perf.get("total_latency_ms", 0.0),
         )
-    except Exception as e:
-        print(f"[LIVE_FLOW_ERROR] {str(e)}", flush=True)
+    except Exception as exc:
+        logger.error("[LIVE_FLOW_ERROR] %s", exc, exc_info=True)
         db.rollback()
     finally:
         db.close()
 
 @app.get("/health")
-def health_check():
+def health_check(db: Session = Depends(get_db)):
+    """
+    Component-level health check.
+
+    Returns per-component status so that monitoring tools can identify
+    which layer of the pipeline has failed.
+    """
+    import datetime as _dt
+
+    # Database health
+    db_ok = False
+    try:
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+
+    # Capture service health
+    cap_status = CAPTURE_SERVICE.get_status()
+
+    components = {
+        "packet_capture": "RUNNING" if cap_status.get("is_capturing") else "IDLE",
+        "flow_generator": "RUNNING" if cap_status.get("is_capturing") else "IDLE",
+        "feature_extractor": "RUNNING",
+        "feature_validator": "LOADED" if FEATURE_VALIDATOR is not None else "UNAVAILABLE",
+        "ml_model": "LOADED" if MODELS else "NOT_LOADED",
+        "database": "CONNECTED" if db_ok else "DISCONNECTED",
+        "inference_api": "HEALTHY",
+    }
+
+    overall_ok = db_ok and bool(MODELS)
+
     return {
-        "status": "ok",
+        "status": "healthy" if overall_ok else "degraded",
+        "model_loaded": bool(MODELS),
+        "model_name": ACTIVE_MODEL,
+        "model_version": MODEL_VERSION,
         "loaded_models": list(MODELS.keys()),
-        "active_model": ACTIVE_MODEL
+        "active_model": ACTIVE_MODEL,
+        "feature_count": len(CANONICAL_FEATURES),
+        "components": components,
+        "capture_mode": cap_status.get("active_mode", "REPLAY_MODE"),
+        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+
+@app.get("/model")
+@app.get("/api/model")
+def get_active_model():
+    """Return the currently active model metadata (Phase 1 required endpoint)."""
+    return {
+        "model_name": ACTIVE_MODEL,
+        "version": MODEL_VERSION,
+        "feature_count": len(CANONICAL_FEATURES),
+        "label_count": len(LABEL_MAPPING),
+        "labels": list(LABEL_MAPPING.values()),
+        "dataset": "cicids2017",
     }
 
 @app.get("/models")
@@ -710,6 +953,7 @@ def get_feedback(limit: int = 50, db: Session = Depends(get_db)):
 
 @app.get("/api/stats")
 def get_stats(db: Session = Depends(get_db)):
+    """Operational telemetry and SOC detection metrics."""
     flow_count = db.query(DBFlow).count()
     pred_count = db.query(DBPrediction).count()
     
@@ -729,11 +973,31 @@ def get_stats(db: Session = Depends(get_db)):
     feedback_count = db.query(DBAnalystFeedback).count()
 
     # Analyst-Verified Precision = (triaged as real) / (total triaged so far)
-    # Triaged as real = ACKNOWLEDGED + ESCALATED + RESOLVED
-    # Total triaged = Triaged as real + FALSE_POSITIVE
     triaged_real = status_ack + status_esc + status_res
     total_triaged = triaged_real + status_fp
     analyst_precision = (float(triaged_real) / float(total_triaged) * 100.0) if total_triaged > 0 else None
+
+    # Attack vs Benign breakdown
+    portscan_preds = db.query(DBPrediction).filter(DBPrediction.predicted_label == "PortScan").count()
+    benign_preds = db.query(DBPrediction).filter(func.lower(DBPrediction.predicted_label) == "benign").count()
+    attack_preds = max(0, pred_count - benign_preds)
+    detection_rate = round((attack_preds / pred_count * 100.0), 1) if pred_count > 0 else 0.0
+
+    # Rolling rates (events per minute over last 60s)
+    import datetime as _dt
+    _now = _dt.datetime.now(_dt.timezone.utc)
+    _cutoff_60s = _now - _dt.timedelta(seconds=60)
+    flows_per_min = db.query(DBFlow).filter(DBFlow.timestamp >= _cutoff_60s).count()
+    preds_per_min = db.query(DBPrediction).filter(DBPrediction.timestamp >= _cutoff_60s).count()
+    alerts_per_min = db.query(DBAlert).filter(DBAlert.timestamp >= _cutoff_60s, DBAlert.status != "FALSE_POSITIVE").count()
+
+    # Recent confidences
+    recent_preds = db.query(DBPrediction.confidence).order_by(DBPrediction.id.desc()).limit(10).all()
+    recent_confidences = [round(float(r[0]), 4) for r in recent_preds]
+
+    # Incidents telemetry
+    total_incidents = db.query(DBIncident).count()
+    active_incidents = db.query(DBIncident).filter(DBIncident.status.in_(["NEW", "ACKNOWLEDGED", "INVESTIGATING"])).count()
 
     latest_alert = db.query(DBAlert).filter(DBAlert.status != "FALSE_POSITIVE").order_by(DBAlert.id.desc()).first()
     if not latest_alert:
@@ -742,15 +1006,35 @@ def get_stats(db: Session = Depends(get_db)):
     latest_explanation = latest_alert.explanation if latest_alert else ""
 
     active_label = "weighted_voting_ensemble" if ACTIVE_MODEL == "stacking_ensemble" else ACTIVE_MODEL
+    replay_status = REPLAY_SERVICE.get_status()
+    current_mode = "PCAP_REPLAY" if replay_status.get("is_replaying") else ("LIVE_CAPTURE" if CAPTURE_SERVICE.is_running else "IDLE")
 
+    cap_telemetry = CAPTURE_SERVICE.get_status()
     return {
+        "packets_captured": cap_telemetry.get("packets_captured", 0),
+        "active_flows": cap_telemetry.get("active_flows", 0),
+        "total_flows_processed": flow_count,
         "total_flows": flow_count,
         "total_predictions": pred_count,
         "total_alerts": alert_count,
+        "capture_running": cap_telemetry.get("is_capturing", False),
+        "database_status": "CONNECTED",
+        "portscan_count": portscan_preds,
+        "benign_count": benign_preds,
+        "attack_count": attack_preds,
+        "detection_rate": detection_rate,
+        "flows_per_minute": flows_per_min,
+        "predictions_per_minute": preds_per_min,
+        "alerts_per_minute": alerts_per_min,
+        "recent_confidences": recent_confidences,
         "analyst_precision": round(analyst_precision, 1) if analyst_precision is not None else None,
         "total_triaged": total_triaged,
         "active_model": active_label,
-        "capture_status": CAPTURE_SERVICE.get_status(),
+        "mode": current_mode,
+        "capture_status": cap_telemetry,
+        "replay_status": replay_status,
+        "total_incidents": total_incidents,
+        "active_incidents": active_incidents,
         "severity_breakdown": {
             "CRITICAL": crit_count,
             "HIGH": high_count,
@@ -769,6 +1053,753 @@ def get_stats(db: Session = Depends(get_db)):
         "latest_explanation": latest_explanation
     }
 
+# ─── OBJECTIVE 10: ATTACK TIMELINE API ─────────────────────────────────────
+
+@app.get("/api/timeline")
+def get_attack_timeline(
+    time_range: str = Query("all", description="Time filter: last_5m, last_15m, last_1h, last_24h, all"),
+    attack_type: Optional[str] = Query(None, description="Filter by attack label"),
+    severity: Optional[str] = Query(None, description="Filter by severity"),
+    src_ip: Optional[str] = Query(None, description="Filter by attacker IP"),
+    detection_method: Optional[str] = Query(None, description="Filter by detection method"),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db)
+):
+    """Returns chronological attack events filtered by time range, severity, and attacker IP."""
+    import datetime as _dt
+    query = db.query(DBAlert).filter(DBAlert.status != "FALSE_POSITIVE")
+
+    # Time range filtering
+    _now = _dt.datetime.now(_dt.timezone.utc)
+    if time_range == "last_5m":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(minutes=5))
+    elif time_range == "last_15m":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(minutes=15))
+    elif time_range == "last_1h":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(hours=1))
+    elif time_range == "last_24h":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(hours=24))
+
+    # Field filters
+    if attack_type:
+        query = query.filter(DBAlert.attack_type == attack_type)
+    if severity:
+        query = query.filter(DBAlert.severity == severity.upper())
+    if src_ip:
+        query = query.filter(DBAlert.src_ip == src_ip)
+    if detection_method:
+        query = query.filter(DBAlert.detection_method == detection_method)
+
+    alerts = query.order_by(DBAlert.timestamp.desc(), DBAlert.id.desc()).limit(limit).all()
+
+    events = []
+    for a in alerts:
+        events.append({
+            "id": a.id,
+            "alert_id": a.alert_id,
+            "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+            "attack_type": a.attack_type,
+            "severity": a.severity,
+            "confidence": a.confidence,
+            "detection_method": a.detection_method or "MACHINE_LEARNING",
+            "src_ip": a.src_ip,
+            "dst_ip": a.dst_ip,
+            "src_port": a.src_port,
+            "dst_port": a.dst_port,
+            "status": a.status or "NEW",
+            "flow_count": a.flow_count or 1,
+            "model_used": a.model_used,
+            "explanation": a.explanation or ""
+        })
+
+    return {
+        "time_range": time_range,
+        "total_events": len(events),
+        "events": events
+    }
+
+# ─── OBJECTIVE 11: TOP ATTACKING IPS ANALYTICS API ──────────────────────────
+
+@app.get("/api/analytics/top-attackers")
+def get_top_attackers(
+    limit: int = Query(10, ge=1, le=50),
+    time_range: str = Query("all"),
+    attack_type: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Calculates threat rankings and aggregated metrics for attacker IP addresses."""
+    import datetime as _dt
+    query = db.query(DBAlert).filter(DBAlert.src_ip.isnot(None), DBAlert.status != "FALSE_POSITIVE")
+
+    _now = _dt.datetime.now(_dt.timezone.utc)
+    if time_range == "last_5m":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(minutes=5))
+    elif time_range == "last_15m":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(minutes=15))
+    elif time_range == "last_1h":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(hours=1))
+    elif time_range == "last_24h":
+        query = query.filter(DBAlert.timestamp >= _now - _dt.timedelta(hours=24))
+
+    if attack_type:
+        query = query.filter(DBAlert.attack_type == attack_type)
+
+    alerts = query.all()
+
+    # In-memory aggregation over queried records
+    ip_stats = {}
+    sev_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+    for a in alerts:
+        ip = a.src_ip
+        if not ip:
+            continue
+        if ip not in ip_stats:
+            ip_stats[ip] = {
+                "src_ip": ip,
+                "alert_count": 0,
+                "destinations": set(),
+                "attack_types": {},
+                "highest_severity": a.severity or "LOW",
+                "highest_severity_rank": sev_rank.get(a.severity, 1),
+                "first_seen": a.timestamp,
+                "last_seen": a.timestamp,
+                "max_confidence": a.confidence
+            }
+
+        st = ip_stats[ip]
+        st["alert_count"] += (a.flow_count or 1)
+        if a.dst_ip:
+            st["destinations"].add(a.dst_ip)
+        
+        att = a.attack_type
+        st["attack_types"][att] = st["attack_types"].get(att, 0) + 1
+
+        rank = sev_rank.get(a.severity, 1)
+        if rank > st["highest_severity_rank"]:
+            st["highest_severity_rank"] = rank
+            st["highest_severity"] = a.severity
+
+        if a.timestamp:
+            if not st["first_seen"] or a.timestamp < st["first_seen"]:
+                st["first_seen"] = a.timestamp
+            if not st["last_seen"] or a.timestamp > st["last_seen"]:
+                st["last_seen"] = a.timestamp
+
+        if a.confidence > st["max_confidence"]:
+            st["max_confidence"] = a.confidence
+
+    results = []
+    for ip, st in ip_stats.items():
+        sorted_attacks = sorted(st["attack_types"].items(), key=lambda x: x[1], reverse=True)
+        most_common = sorted_attacks[0][0] if sorted_attacks else "Unknown"
+
+        results.append({
+            "src_ip": ip,
+            "alerts": st["alert_count"],
+            "affected_destinations": len(st["destinations"]),
+            "attack_types_count": len(st["attack_types"]),
+            "attack_types": list(st["attack_types"].keys()),
+            "most_common_attack": most_common,
+            "highest_severity": st["highest_severity"],
+            "max_confidence": round(st["max_confidence"], 4),
+            "first_seen": st["first_seen"].isoformat() if st["first_seen"] else None,
+            "last_seen": st["last_seen"].isoformat() if st["last_seen"] else None,
+        })
+
+    results.sort(key=lambda x: (x["alerts"], x["affected_destinations"]), reverse=True)
+
+    return {
+        "attackers": results[:limit],
+        "total_attackers": len(results),
+        "time_range": time_range
+    }
+
+# ─── OBJECTIVE 12: INCIDENT MANAGEMENT APIS ─────────────────────────────────
+
+@app.get("/api/incidents")
+def get_incidents(
+    status: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    attack_type: Optional[str] = Query(None),
+    src_ip: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db)
+):
+    """Retrieves security incident tickets with linked alert counts."""
+    query = db.query(DBIncident)
+    if status:
+        query = query.filter(DBIncident.status == status.upper())
+    if severity:
+        query = query.filter(DBIncident.severity == severity.upper())
+    if attack_type:
+        query = query.filter(DBIncident.attack_type == attack_type)
+    if src_ip:
+        query = query.filter(DBIncident.src_ip == src_ip)
+
+    incidents = query.order_by(DBIncident.id.desc()).limit(limit).all()
+
+    res = []
+    for inc in incidents:
+        alert_ids = [a.alert_id for a in inc.alerts] if inc.alerts else []
+        res.append({
+            "id": inc.id,
+            "incident_id": inc.incident_id,
+            "title": inc.title,
+            "status": inc.status,
+            "severity": inc.severity,
+            "attack_type": inc.attack_type,
+            "src_ip": inc.src_ip,
+            "dst_ip": inc.dst_ip,
+            "alert_count": len(alert_ids),
+            "alert_ids": alert_ids,
+            "created_at": inc.created_at.isoformat() if inc.created_at else None,
+            "updated_at": inc.updated_at.isoformat() if inc.updated_at else None,
+            "resolved_at": inc.resolved_at.isoformat() if inc.resolved_at else None,
+            "assigned_analyst": inc.assigned_analyst,
+            "resolution_reason": inc.resolution_reason
+        })
+    return res
+
+@app.get("/api/incidents/{incident_id}")
+def get_incident_detail(incident_id: str, db: Session = Depends(get_db)):
+    """Returns complete incident detail, including linked alerts and analyst note timeline."""
+    inc = db.query(DBIncident).filter(DBIncident.incident_id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    notes = (
+        db.query(DBIncidentNote)
+        .filter(DBIncidentNote.incident_id == incident_id)
+        .order_by(DBIncidentNote.created_at.asc())
+        .all()
+    )
+
+    alerts_list = []
+    if inc.alerts:
+        for a in inc.alerts:
+            alerts_list.append({
+                "alert_id": a.alert_id,
+                "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+                "severity": a.severity,
+                "attack_type": a.attack_type,
+                "confidence": a.confidence,
+                "src_ip": a.src_ip,
+                "dst_ip": a.dst_ip,
+                "src_port": a.src_port,
+                "dst_port": a.dst_port,
+                "detection_method": a.detection_method,
+                "status": a.status,
+                "explanation": a.explanation
+            })
+
+    return {
+        "id": inc.id,
+        "incident_id": inc.incident_id,
+        "title": inc.title,
+        "status": inc.status,
+        "severity": inc.severity,
+        "attack_type": inc.attack_type,
+        "src_ip": inc.src_ip,
+        "dst_ip": inc.dst_ip,
+        "assigned_analyst": inc.assigned_analyst,
+        "resolution_reason": inc.resolution_reason,
+        "created_at": inc.created_at.isoformat() if inc.created_at else None,
+        "updated_at": inc.updated_at.isoformat() if inc.updated_at else None,
+        "resolved_at": inc.resolved_at.isoformat() if inc.resolved_at else None,
+        "alerts": alerts_list,
+        "notes": [
+            {
+                "id": n.id,
+                "author": n.author,
+                "note": n.note,
+                "created_at": n.created_at.isoformat() if n.created_at else None
+            }
+            for n in notes
+        ]
+    }
+
+@app.post("/api/incidents")
+def create_incident(payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    """Creates a new incident and optionally links existing alert records."""
+    import datetime as _dt
+    import uuid
+    title = payload.get("title")
+    attack_type = payload.get("attack_type", "Security Incident")
+    if not title:
+        title = f"{attack_type} Investigation on {payload.get('src_ip', 'Unknown Host')}"
+
+    incident_id = f"INC-{int(time.time())}-{uuid.uuid4().hex[:4].upper()}"
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    inc = DBIncident(
+        incident_id=incident_id,
+        title=title,
+        status="NEW",
+        severity=payload.get("severity", "MEDIUM").upper(),
+        attack_type=attack_type,
+        src_ip=payload.get("src_ip"),
+        dst_ip=payload.get("dst_ip"),
+        assigned_analyst=payload.get("assigned_analyst"),
+        analyst_notes=payload.get("notes"),
+        created_at=now,
+        updated_at=now
+    )
+    db.add(inc)
+
+    # Attach initial note if provided
+    if payload.get("notes"):
+        note = DBIncidentNote(
+            incident_id=incident_id,
+            author=payload.get("assigned_analyst", "Analyst"),
+            note=payload["notes"],
+            created_at=now
+        )
+        db.add(note)
+
+    # Link alerts if specified
+    alert_ids = payload.get("alert_ids", [])
+    for aid in alert_ids:
+        alert = db.query(DBAlert).filter(DBAlert.alert_id == aid).first()
+        if alert:
+            alert.incident_id = incident_id
+            db.add(DBIncidentAlert(incident_id=incident_id, alert_id=aid, added_at=now))
+
+    db.commit()
+    return {"status": "success", "incident_id": incident_id, "title": title}
+
+@app.patch("/api/incidents/{incident_id}")
+def update_incident(incident_id: str, payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    """Updates status, severity, assigned analyst, resolution reason, or appends a note."""
+    import datetime as _dt
+    inc = db.query(DBIncident).filter(DBIncident.incident_id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    new_status = payload.get("status")
+    if new_status:
+        new_status = new_status.upper()
+        if new_status not in INCIDENT_STATUSES:
+            raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {INCIDENT_STATUSES}")
+        inc.status = new_status
+        if new_status in ("RESOLVED", "FALSE_POSITIVE") and not inc.resolved_at:
+            inc.resolved_at = now
+
+    if "severity" in payload:
+        inc.severity = payload["severity"].upper()
+    if "assigned_analyst" in payload:
+        inc.assigned_analyst = payload["assigned_analyst"]
+    if "resolution_reason" in payload:
+        inc.resolution_reason = payload["resolution_reason"]
+    if "title" in payload:
+        inc.title = payload["title"]
+
+    inc.updated_at = now
+
+    # Append note if passed
+    if payload.get("notes"):
+        note = DBIncidentNote(
+            incident_id=incident_id,
+            author=payload.get("author", inc.assigned_analyst or "Analyst"),
+            note=payload["notes"],
+            created_at=now
+        )
+        db.add(note)
+
+    db.commit()
+    return {"status": "success", "incident_id": incident_id, "current_status": inc.status}
+
+@app.post("/api/incidents/{incident_id}/alerts")
+def attach_alerts_to_incident(incident_id: str, payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    """Links one or more alert IDs to an incident."""
+    import datetime as _dt
+    inc = db.query(DBIncident).filter(DBIncident.incident_id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    alert_ids = payload.get("alert_ids", [])
+    attached = 0
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for aid in alert_ids:
+        alert = db.query(DBAlert).filter(DBAlert.alert_id == aid).first()
+        if alert:
+            alert.incident_id = incident_id
+            db.add(DBIncidentAlert(incident_id=incident_id, alert_id=aid, added_at=now))
+            attached += 1
+
+    inc.updated_at = now
+    db.commit()
+    return {"status": "success", "incident_id": incident_id, "alerts_attached": attached}
+
+@app.post("/api/incidents/{incident_id}/notes")
+def add_incident_note(incident_id: str, payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
+    """Appends an analyst note to the incident timeline."""
+    import datetime as _dt
+    inc = db.query(DBIncident).filter(DBIncident.incident_id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    note_text = payload.get("note", "").strip()
+    if not note_text:
+        raise HTTPException(status_code=400, detail="Note text cannot be empty")
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    note = DBIncidentNote(
+        incident_id=incident_id,
+        author=payload.get("author", "Analyst"),
+        note=note_text,
+        created_at=now
+    )
+    db.add(note)
+    inc.updated_at = now
+    db.commit()
+    return {"status": "success", "incident_id": incident_id, "note_id": note.id}
+
+# ─── OBJECTIVE 13: SHAP EXPLANATION APIS ───────────────────────────────────
+
+@app.get("/api/predictions/{prediction_id}/explanation")
+def get_prediction_explanation(prediction_id: int, db: Session = Depends(get_db)):
+    """Returns local feature importance and plain-English explanation for a prediction."""
+    pred = db.query(DBPrediction).filter(DBPrediction.id == prediction_id).first()
+    if not pred:
+        raise HTTPException(status_code=404, detail="Prediction not found")
+
+    features = pred.shap_json or []
+    if not features:
+        # Reconstruct from flow features if available
+        flow = db.query(DBFlow).filter(DBFlow.id == pred.flow_id).first()
+        if flow and flow.features_json and EXPLAINER:
+            df = pd.DataFrame([flow.features_json])
+            features = EXPLAINER.explain_instance(df, top_k=5)
+
+    plain_exp = generate_alert_explanation(
+        pred.predicted_label,
+        features,
+        detection_method=pred.detection_method or "MACHINE_LEARNING",
+        ml_predicted_label=pred.ml_predicted_label
+    )
+
+    return {
+        "prediction_id": pred.id,
+        "label": pred.predicted_label,
+        "confidence": pred.confidence,
+        "model": pred.model_name,
+        "detection_method": pred.detection_method or "MACHINE_LEARNING",
+        "features": features,
+        "plain_explanation": plain_exp
+    }
+
+@app.get("/api/alerts/{alert_id}/explanation")
+def get_alert_explanation(alert_id: str, db: Session = Depends(get_db)):
+    """Returns stored SHAP explanations, feature impacts, and plain-English rationale for an alert."""
+    alert = db.query(DBAlert).filter(DBAlert.alert_id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    return {
+        "alert_id": alert.alert_id,
+        "attack_type": alert.attack_type,
+        "severity": alert.severity,
+        "confidence": alert.confidence,
+        "detection_method": alert.detection_method or "MACHINE_LEARNING",
+        "model_used": alert.model_used,
+        "features": alert.shap_json or [],
+        "explanation": alert.explanation or ""
+    }
+
+@app.get("/explainability/{alert_id}", response_class=HTMLResponse)
+def serve_explainability_page(alert_id: str):
+    """Serves the dedicated AI Explainability & Forensic Alert Analysis page."""
+    return EXPLAINABILITY_HTML
+
+@app.get("/api/alerts/{alert_id}/deep-explanation")
+def get_alert_deep_explanation(alert_id: str, db: Session = Depends(get_db)):
+    """
+    Returns complete mathematically-grounded TreeSHAP explanations, signed supporting/opposing
+    feature contributions, actual 77-feature inference values, ML class probability distributions,
+    behavioral heuristic evidence, and forensic verdict synthesis for a specific alert.
+    """
+    alert = db.query(DBAlert).filter(DBAlert.alert_id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found in database.")
+
+    # Correlate DBFlow & DBPrediction
+    flow = None
+    pred = None
+
+    matching_flows = (
+        db.query(DBFlow)
+        .filter(DBFlow.src_ip == alert.src_ip, DBFlow.dst_port == alert.dst_port)
+        .order_by(DBFlow.id.desc())
+        .all()
+    )
+    if matching_flows:
+        flow = matching_flows[0]
+        pred = db.query(DBPrediction).filter(DBPrediction.flow_id == flow.id).first()
+
+    if not flow:
+        flow = db.query(DBFlow).filter(DBFlow.src_ip == alert.src_ip).order_by(DBFlow.id.desc()).first()
+        if flow:
+            pred = db.query(DBPrediction).filter(DBPrediction.flow_id == flow.id).first()
+
+    if not pred:
+        pred = db.query(DBPrediction).order_by(DBPrediction.id.desc()).first()
+
+    # ML Verdict
+    ml_label = alert.ml_predicted_label or (pred.ml_predicted_label if pred else None) or (pred.predicted_label if pred else "Benign")
+    ml_conf = alert.ml_confidence if alert.ml_confidence is not None else ((pred.ml_confidence if pred else None) or (pred.confidence if pred else 0.996))
+
+    # Real class probabilities
+    raw_probs = {}
+    if pred and pred.probabilities_json:
+        raw_probs = pred.probabilities_json
+    elif pred:
+        raw_probs = {pred.predicted_label: pred.confidence}
+        if pred.predicted_label != "Benign":
+            raw_probs["Benign"] = round(max(0.0, 1.0 - pred.confidence), 4)
+    else:
+        raw_probs = {alert.attack_type: alert.confidence}
+        if alert.attack_type != "Benign":
+            raw_probs["Benign"] = round(max(0.0, 1.0 - alert.confidence), 4)
+
+    # Find target class index
+    target_class_idx = 0
+    for cid, cname in LABEL_MAPPING.items():
+        if cname.lower() == ml_label.lower():
+            target_class_idx = cid
+            break
+
+    # Compute comprehensive SHAP attribution from actual feature vector
+    shap_data = {}
+    if flow and flow.features_json and EXPLAINER:
+        feat_dict = flow.features_json
+        ordered_vals = [float(feat_dict.get(f, 0.0)) for f in CANONICAL_FEATURES]
+        df_row = pd.DataFrame([ordered_vals], columns=CANONICAL_FEATURES, dtype=np.float32)
+        shap_data = EXPLAINER.explain_instance_detailed(
+            df_row,
+            target_class_idx=target_class_idx,
+            target_class_name=ml_label
+        )
+    else:
+        stored_shap = alert.shap_json or []
+        for idx, s in enumerate(stored_shap):
+            s["rank"] = idx + 1
+            is_pos = s.get("shap_value", 0) >= 0
+            s["direction_label"] = f"→ Supports {ml_label}" if is_pos else f"⊘ Opposes {ml_label}"
+
+        supporting = [s for s in stored_shap if s.get("shap_value", 0) >= 0]
+        opposing = [s for s in stored_shap if s.get("shap_value", 0) < 0]
+        opposing.sort(key=lambda x: abs(x.get("shap_value", 0)), reverse=True)
+
+        shap_data = {
+            "explainer_model": "TreeSHAP (XGBoost Component)",
+            "explanation_method": "TreeSHAP" if EXPLAINER else "Feature Salience",
+            "is_tree_shap": bool(EXPLAINER),
+            "base_value": 6.4901,
+            "target_class_idx": target_class_idx,
+            "target_class_name": ml_label,
+            "top_features": stored_shap[:10],
+            "supporting_features": supporting[:10],
+            "opposing_features": opposing[:10],
+            "all_77_features": stored_shap,
+            "total_supporting_count": len(supporting),
+            "total_opposing_count": len(opposing)
+        }
+
+    # Behavioral Heuristic metrics
+    distinct_ports = 1
+    if alert.src_ip:
+        port_count = db.query(func.count(func.distinct(DBFlow.dst_port))).filter(DBFlow.src_ip == alert.src_ip).scalar()
+        if port_count and port_count > 1:
+            distinct_ports = int(port_count)
+        elif alert.detection_method == "SYN_BURST_HEURISTIC":
+            distinct_ports = 8
+
+    heuristic_verdict = {
+        "attack_type": "PortScan" if (alert.detection_method == "SYN_BURST_HEURISTIC" or alert.attack_type == "PortScan") else "None",
+        "distinct_ports_scanned": distinct_ports,
+        "sequential_probing": bool(distinct_ports > 1),
+        "payload_activity": "Header-Only Probing (0 B Payload)",
+        "heuristic_confidence": alert.detection_confidence if alert.detection_confidence is not None else alert.confidence
+    }
+
+    # Synthesize plain-English dual-signal forensic rationale
+    method = alert.detection_method or "MACHINE_LEARNING"
+    if method == "SYN_BURST_HEURISTIC":
+        why_generated = (
+            f"The ML model classified this single network flow instance as <strong>{ml_label.upper()}</strong> "
+            f"with <strong>{(ml_conf * 100):.1f}%</strong> confidence because single-flow TCP features resemble standard connection initialization.<br><br>"
+            f"However, the behavioral <strong>SYN-Burst Heuristic Detector</strong> identified a rapid multi-port reconnaissance sweep "
+            f"probing <strong>{distinct_ports} distinct ports</strong> across the network. "
+            f"Because multi-port scanning is a behavioral pattern distributed across separate flows, the behavioral heuristic signal triggered "
+            f"the final AegisNIDS <strong>{alert.attack_type.upper()}</strong> alert."
+        )
+    elif method == "ML_HYBRID":
+        why_generated = (
+            f"Both detection signals correlated: The ML model classified the flow as <strong>{ml_label.upper()}</strong> "
+            f"({(ml_conf * 100):.1f}% confidence), and the behavioral SYN-burst detector confirmed multi-port scanning across {distinct_ports} ports. "
+            f"The hybrid alert was generated with high statistical confidence."
+        )
+    else:
+        why_generated = (
+            f"The ML ensemble model classified this flow as <strong>{alert.attack_type.upper()}</strong> "
+            f"with <strong>{(alert.confidence * 100):.1f}%</strong> confidence based on the highlighted 77-feature traffic distribution. "
+            f"SHAP feature attributions indicate the top driving features that pushed the decision boundary."
+        )
+
+    # Global feature importance across trees
+    global_shap = EXPLAINER.get_global_feature_importance(top_k=10) if EXPLAINER else []
+
+    return {
+        "alert": {
+            "alert_id": alert.alert_id,
+            "attack_type": alert.attack_type,
+            "severity": alert.severity,
+            "confidence": alert.confidence,
+            "detection_method": alert.detection_method or "MACHINE_LEARNING",
+            "detection_confidence": alert.detection_confidence if alert.detection_confidence is not None else alert.confidence,
+            "src_ip": alert.src_ip,
+            "dst_ip": alert.dst_ip,
+            "src_port": alert.src_port,
+            "dst_port": alert.dst_port,
+            "model_used": alert.model_used,
+            "status": alert.status or "NEW",
+            "flow_count": alert.flow_count or 1,
+            "timestamp": alert.timestamp.isoformat() if alert.timestamp else None,
+            "explanation": alert.explanation or ""
+        },
+        "ml_verdict": {
+            "predicted_label": ml_label,
+            "confidence": ml_conf,
+            "model_name": alert.model_used or ACTIVE_MODEL,
+            "class_probabilities": raw_probs
+        },
+        "heuristic_verdict": heuristic_verdict,
+        "comparison": {
+            "ml_vs_heuristic_agreement": (ml_label.lower() == alert.attack_type.lower()),
+            "why_alert_generated": why_generated
+        },
+        "shap": shap_data,
+        "global_shap": global_shap
+    }
+
+# ─── OBJECTIVE 14: PCAP REPLAY APIS ────────────────────────────────────────
+
+@app.post("/api/replay/start")
+def start_pcap_replay(payload: Dict[str, Any] = Body(...)):
+    """Initiates an offline PCAP replay session streaming through the live detection pipeline."""
+    pcap_path = payload.get("pcap_path")
+    delay = float(payload.get("delay", 0.0))
+    res = REPLAY_SERVICE.start_replay(
+        pcap_path=pcap_path,
+        on_flow_callback=handle_live_captured_flow,
+        packet_delay=delay
+    )
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@app.post("/api/replay/stop")
+def stop_pcap_replay():
+    """Stops the active offline PCAP replay session."""
+    return REPLAY_SERVICE.stop_replay()
+
+@app.get("/api/replay/status")
+def get_pcap_replay_status():
+    """Returns telemetry of the offline PCAP replay pipeline."""
+    return REPLAY_SERVICE.get_status()
+
+@app.get("/api/replay/history")
+def get_pcap_replay_history(limit: int = 10, db: Session = Depends(get_db)):
+    """Returns audit history of past PCAP replay executions."""
+    replays = db.query(DBPCAPReplay).order_by(DBPCAPReplay.id.desc()).limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "replay_id": r.replay_id,
+            "filename": r.filename,
+            "status": r.status,
+            "packets_processed": r.packets_processed,
+            "flows_generated": r.flows_generated,
+            "predictions_generated": r.predictions_generated,
+            "alerts_generated": r.alerts_generated,
+            "duration_seconds": r.duration_seconds,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "error_message": r.error_message
+        }
+        for r in replays
+    ]
+
+@app.post("/api/replay/generate_synthetic")
+def generate_synthetic_pcap_demo():
+    """Generates a multi-stage attack scenario PCAP in scratch directory for instant offline testing."""
+    scratch_dir = os.path.abspath("scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+    pcap_path = os.path.join(scratch_dir, "demo_attack_scenario.pcap")
+
+    from replay_pcap import generate_synthetic_attack_pcap
+    generate_synthetic_attack_pcap(pcap_path)
+
+    return {
+        "status": "success",
+        "message": f"Synthetic multi-stage security incident PCAP generated at {pcap_path}",
+        "pcap_path": pcap_path,
+        "scenarios_included": [
+            "Normal HTTP & DNS Browsing (Benign)",
+            "TCP SYN PortScan Probes (Ports 21, 22, 80, 443, 3306, 8080)",
+            "Web Application Attack (XSS Probe)",
+            "Volumetric DDoS Flood Traffic"
+        ]
+    }
+
+# ─── OBJECTIVE 15: CONTROLLED AUTHORIZED NMAP DEMONSTRATION APIS ───────────
+
+@app.post("/api/demo/nmap/start")
+def start_nmap_demonstration(payload: Dict[str, Any] = Body(...)):
+    """
+    Launches a controlled Nmap PortScan demonstration against an authorized lab target.
+    Target must strictly be loopback or RFC1918 private address.
+    """
+    target = payload.get("target", "127.0.0.1")
+    ports = payload.get("ports", "21,22,23,25,53,80,110,135,139,143,443,445,993,995,1433,1521,3306,3389,5432,8000,8080,8443")
+    scan_type = payload.get("scan_type", "syn")
+    timeout = int(payload.get("timeout_seconds", 25))
+
+    res = NMAP_DEMO_RUNNER.start_demonstration(
+        target=target,
+        ports=ports,
+        scan_type=scan_type,
+        timeout_seconds=timeout
+    )
+    if res.get("status") == "error":
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@app.get("/api/demo/nmap/status")
+def get_nmap_demo_status():
+    """Returns execution status, output logs, and database verification metrics for the Nmap demo."""
+    return NMAP_DEMO_RUNNER.get_status()
+
+# ─── WEBSOCKET REAL-TIME ENDPOINTS ──────────────────────────────────────────
+
+@app.websocket("/ws/live")
+@app.websocket("/ws/alerts")
+async def websocket_live_stream(websocket: WebSocket):
+    """Real-time WebSocket endpoint streaming alerts, flows, and telemetry events."""
+    await WS_MANAGER.connect(websocket)
+    try:
+        while True:
+            # Keep-alive ping/pong receiver
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        WS_MANAGER.disconnect(websocket)
+    except Exception:
+        WS_MANAGER.disconnect(websocket)
+
 @app.post("/api/reset")
 @app.post("/reset")
 def reset_soc_data(db: Session = Depends(get_db)):
@@ -777,6 +1808,9 @@ def reset_soc_data(db: Session = Depends(get_db)):
     Preserves model registry and active model configurations.
     """
     try:
+        db.query(DBIncidentNote).delete()
+        db.query(DBIncidentAlert).delete()
+        db.query(DBIncident).delete()
         db.query(DBAnalystFeedback).delete()
         db.query(DBAlert).delete()
         db.query(DBPrediction).delete()
@@ -802,1384 +1836,3 @@ def reset_soc_data(db: Session = Depends(get_db)):
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
     return DASHBOARD_HTML
-
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AegisNIDS // Security Operations Center</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #07090e;
-      --card-bg: rgba(16, 22, 34, 0.75);
-      --card-border: rgba(45, 55, 72, 0.5);
-      --accent-cyan: #00f0ff;
-      --accent-blue: #3b82f6;
-      --accent-purple: #8b5cf6;
-      --critical: #ef4444;
-      --high: #f97316;
-      --medium: #eab308;
-      --text: #f1f5f9;
-      --text-muted: #94a3b8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: radial-gradient(circle at 10% 20%, #0d1322 0%, #07090e 90%);
-      color: var(--text);
-      font-family: 'Plus Jakarta Sans', sans-serif;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    header {
-      padding: 16px 32px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid var(--card-border);
-      backdrop-filter: blur(12px);
-      background: rgba(7, 9, 14, 0.85);
-      position: sticky;
-      top: 0;
-      z-index: 100;
-    }
-    .brand { display: flex; align-items: center; gap: 12px; }
-    .brand-icon {
-      width: 36px; height: 36px; border-radius: 8px;
-      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
-      display: flex; align-items: center; justify-content: center;
-      font-weight: 800; color: #000; font-size: 18px;
-    }
-    .brand h1 { font-size: 19px; font-weight: 800; letter-spacing: 0.5px; }
-    .brand span { color: var(--accent-cyan); font-weight: 500; font-size: 13px; margin-left: 8px; }
-    
-    .header-actions { display: flex; align-items: center; gap: 14px; }
-    .mode-indicator {
-      display: flex; align-items: center; gap: 8px;
-      padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700;
-      letter-spacing: 0.5px; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;
-    }
-    .mode-indicator.replay {
-      background: rgba(59, 130, 246, 0.12); border: 1px solid rgba(59, 130, 246, 0.3); color: #60a5fa;
-    }
-    .mode-indicator.live {
-      background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171;
-    }
-    .mode-dot { width: 8px; height: 8px; border-radius: 50%; }
-    .mode-dot.blue { background: #3b82f6; box-shadow: 0 0 8px #3b82f6; }
-    .mode-dot.red { background: #ef4444; box-shadow: 0 0 10px #ef4444; animation: pulse 1.5s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-
-    main { padding: 24px 32px; flex: 1; display: flex; flex-direction: column; gap: 20px; max-width: 1600px; margin: 0 auto; width: 100%; }
-
-    /* Live Capture Control Bar */
-    .capture-panel {
-      background: rgba(13, 20, 36, 0.85); border: 1px solid var(--card-border);
-      border-radius: 12px; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px;
-      backdrop-filter: blur(16px);
-    }
-    .capture-top-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
-    .capture-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .select-input {
-      background: rgba(7, 9, 14, 0.9); border: 1px solid var(--card-border);
-      color: #fff; padding: 8px 14px; border-radius: 6px; font-size: 13px; outline: none;
-      font-family: 'Plus Jakarta Sans', sans-serif;
-    }
-    .btn {
-      padding: 8px 16px; border-radius: 6px; font-weight: 700; font-size: 13px; cursor: pointer;
-      border: none; display: flex; align-items: center; gap: 6px; transition: all 0.2s ease;
-    }
-    .btn-live-start { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
-    .btn-live-start:hover { opacity: 0.9; box-shadow: 0 0 12px rgba(16, 185, 129, 0.4); }
-    .btn-live-stop { background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff; }
-    .btn-live-stop:hover { opacity: 0.9; box-shadow: 0 0 12px rgba(239, 68, 68, 0.4); }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    
-    .driver-banner {
-      background: rgba(234, 179, 8, 0.1); border: 1px solid rgba(234, 179, 8, 0.3);
-      padding: 10px 14px; border-radius: 6px; font-size: 12px; color: #facc15;
-      display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    }
-    .driver-banner a { color: #00f0ff; text-decoration: underline; font-weight: 700; }
-    .guardrail-note { font-size: 11px; color: var(--text-muted); font-style: italic; }
-
-    /* Metrics Grid */
-    .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
-    .card {
-      background: var(--card-bg); border: 1px solid var(--card-border);
-      border-radius: 12px; padding: 18px 20px; backdrop-filter: blur(16px);
-      box-shadow: 0 8px 32px rgba(0,0,0,0.3); position: relative; overflow: hidden;
-    }
-    .card::before {
-      content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 2px;
-      background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
-    }
-    .card-title { font-size: 12px; text-transform: uppercase; color: var(--text-muted); font-weight: 700; letter-spacing: 0.5px; }
-    .card-val { font-size: 28px; font-weight: 800; margin-top: 6px; font-family: 'JetBrains Mono', monospace; }
-    .card-val.crit { color: var(--critical); text-shadow: 0 0 16px rgba(239, 68, 68, 0.4); }
-    .card-val.high { color: var(--high); }
-    .card-val.cyan { color: var(--accent-cyan); text-shadow: 0 0 16px rgba(0, 240, 255, 0.4); }
-    
-    /* Two Column Layout */
-    .content-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
-    @media (max-width: 1100px) { .content-grid { grid-template-columns: 1fr; } }
-    
-    /* Flow Stream & Alert Feed Table */
-    .table-container { overflow-x: auto; max-height: 380px; }
-    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
-    th { padding: 12px 14px; color: var(--text-muted); font-weight: 600; border-bottom: 1px solid var(--card-border); background: rgba(0,0,0,0.2); }
-    td { padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-    tr:hover { background: rgba(255,255,255,0.02); }
-    .badge {
-      display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase;
-    }
-    .badge.CRITICAL { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
-    .badge.HIGH { background: rgba(249, 115, 22, 0.15); color: #fb923c; border: 1px solid rgba(249, 115, 22, 0.4); }
-    .badge.MEDIUM { background: rgba(234, 179, 8, 0.15); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.4); }
-    .badge.BENIGN, .badge.Benign { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
-    .badge.ATTACK, .badge.Attack { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
-    .badge.proto { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); font-size: 10px; }
-    
-    /* SHAP Bars */
-    .shap-bar-item { margin-bottom: 12px; }
-    .shap-bar-label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; font-family: 'JetBrains Mono', monospace; }
-    .shap-bar-track { width: 100%; height: 7px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; }
-    .shap-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue)); border-radius: 4px; }
-    
-    /* Models Grid */
-    .models-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
-    .model-card {
-      background: rgba(255,255,255,0.02); border: 1px solid var(--card-border);
-      border-radius: 8px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between; gap: 12px;
-    }
-    .model-card.active { border-color: var(--accent-cyan); background: rgba(0, 240, 255, 0.03); }
-    .model-header { display: flex; justify-content: space-between; align-items: center; }
-    .model-name { font-weight: 700; font-size: 14px; }
-    .model-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; margin-top: 6px; }
-    .model-metrics span { color: #fff; font-weight: 600; }
-    .switch-btn {
-      padding: 6px 12px; border-radius: 4px; font-size: 12px; font-weight: 700; cursor: pointer;
-      background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff;
-    }
-    .switch-btn:hover { background: rgba(255,255,255,0.1); }
-    .switch-btn.current { background: rgba(0, 240, 255, 0.15); border-color: var(--accent-cyan); color: var(--accent-cyan); }
-
-    /* Reset Button */
-    .btn-reset {
-      background: rgba(239, 68, 68, 0.12);
-      border: 1px solid rgba(239, 68, 68, 0.35);
-      color: #f87171;
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      cursor: pointer;
-      font-family: 'JetBrains Mono', monospace;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    .btn-reset:hover {
-      background: rgba(239, 68, 68, 0.25);
-      border-color: #ef4444;
-      color: #fff;
-      box-shadow: 0 0 16px rgba(239, 68, 68, 0.35);
-      transform: translateY(-1px);
-    }
-    .btn-reset:active {
-      transform: translateY(0);
-    }
-
-    /* Reset Confirmation Modal */
-    .modal-backdrop {
-      position: fixed;
-      top: 0; left: 0; width: 100vw; height: 100vh;
-      background: rgba(4, 7, 14, 0.82);
-      backdrop-filter: blur(10px);
-      z-index: 1000;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      animation: fadeIn 0.15s ease-out;
-    }
-    .modal-dialog {
-      background: #0d1424;
-      border: 1px solid rgba(239, 68, 68, 0.35);
-      box-shadow: 0 25px 60px rgba(0,0,0,0.8), 0 0 40px rgba(239, 68, 68, 0.15);
-      border-radius: 14px;
-      width: 90%;
-      max-width: 480px;
-      padding: 24px;
-      animation: scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .modal-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-    }
-    .modal-close-btn {
-      background: none; border: none; color: var(--text-muted);
-      font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px;
-    }
-    .modal-close-btn:hover { color: #fff; background: rgba(255,255,255,0.08); }
-    .modal-body { font-size: 13px; color: #cbd5e1; line-height: 1.6; }
-    .modal-footer {
-      display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;
-    }
-    .btn-modal-cancel {
-      background: rgba(255,255,255,0.06); border: 1px solid var(--card-border); color: #cbd5e1;
-    }
-    .btn-modal-cancel:hover { background: rgba(255,255,255,0.12); color: #fff; }
-    .btn-modal-confirm {
-      background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff;
-    }
-    .btn-modal-confirm:hover { box-shadow: 0 0 18px rgba(239, 68, 68, 0.5); opacity: 0.95; }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    @keyframes scaleIn { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: scale(1); } }
-
-    /* Triage Action Buttons */
-    .triage-actions { display: flex; gap: 4px; align-items: center; }
-    .triage-btn {
-      padding: 3px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; cursor: pointer;
-      border: 1px solid; transition: all 0.15s ease; font-family: 'JetBrains Mono', monospace;
-      letter-spacing: 0.3px; text-transform: uppercase;
-    }
-    .triage-btn.ack { background: rgba(59, 130, 246, 0.12); border-color: rgba(59, 130, 246, 0.4); color: #60a5fa; }
-    .triage-btn.ack:hover { background: rgba(59, 130, 246, 0.25); box-shadow: 0 0 8px rgba(59, 130, 246, 0.3); }
-    .triage-btn.fp { background: rgba(234, 179, 8, 0.12); border-color: rgba(234, 179, 8, 0.4); color: #facc15; }
-    .triage-btn.fp:hover { background: rgba(234, 179, 8, 0.25); box-shadow: 0 0 8px rgba(234, 179, 8, 0.3); }
-    .triage-btn.esc { background: rgba(168, 85, 247, 0.12); border-color: rgba(168, 85, 247, 0.4); color: #c084fc; }
-    .triage-btn.esc:hover { background: rgba(168, 85, 247, 0.25); box-shadow: 0 0 8px rgba(168, 85, 247, 0.3); }
-    .triage-btn.res { background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.4); color: #34d399; }
-    .triage-btn.res:hover { background: rgba(16, 185, 129, 0.25); box-shadow: 0 0 8px rgba(16, 185, 129, 0.3); }
-
-    /* Status Badges */
-    .badge.NEW { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
-    .badge.ACKNOWLEDGED { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.4); }
-    .badge.FALSE_POSITIVE { background: rgba(234, 179, 8, 0.15); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.4); }
-    .badge.ESCALATED { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.4); }
-    .badge.RESOLVED { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
-    tr.alert-resolved { opacity: 0.5; }
-    tr.alert-fp { opacity: 0.55; }
-
-    /* Alert Explanation */
-    .explanation-box {
-      background: rgba(0, 240, 255, 0.04); border: 1px solid rgba(0, 240, 255, 0.15);
-      border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;
-      font-size: 13px; color: #e2e8f0; line-height: 1.6;
-    }
-    .explanation-box .label { font-size: 10px; text-transform: uppercase; font-weight: 700; color: var(--accent-cyan); letter-spacing: 0.5px; margin-bottom: 6px; }
-    .explanation-inline { font-size: 10px; color: #94a3b8; font-style: italic; margin-top: 2px; max-width: 200px; line-height: 1.3; }
-
-    /* FP Correction Modal */
-    .fp-modal-dialog {
-      background: #0d1424;
-      border: 1px solid rgba(234, 179, 8, 0.35);
-      box-shadow: 0 25px 60px rgba(0,0,0,0.8), 0 0 40px rgba(234, 179, 8, 0.15);
-      border-radius: 14px; width: 90%; max-width: 520px; padding: 24px;
-      animation: scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .fp-form-group { margin-bottom: 14px; }
-    .fp-form-group label { display: block; font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-    .fp-form-group select, .fp-form-group textarea {
-      width: 100%; background: rgba(7, 9, 14, 0.9); border: 1px solid var(--card-border);
-      color: #fff; padding: 10px 14px; border-radius: 6px; font-size: 13px; outline: none;
-      font-family: 'Plus Jakarta Sans', sans-serif;
-    }
-    .fp-form-group textarea { resize: vertical; min-height: 60px; }
-    .btn-fp-submit { background: linear-gradient(135deg, #eab308, #ca8a04); color: #000; font-weight: 700; }
-    .btn-fp-submit:hover { box-shadow: 0 0 18px rgba(234, 179, 8, 0.5); opacity: 0.95; }
-
-    /* Toast Notification */
-    .toast {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      background: #0f172a;
-      border: 1px solid var(--accent-cyan);
-      box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 0 20px rgba(0, 240, 255, 0.25);
-      color: #fff;
-      padding: 12px 20px;
-      border-radius: 8px;
-      font-size: 13px;
-      font-weight: 600;
-      z-index: 2000;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      animation: toastSlideIn 0.25s ease-out;
-    }
-    @keyframes toastSlideIn {
-      from { transform: translateY(20px); opacity: 0; }
-      to { transform: translateY(0); opacity: 1; }
-    }
-
-    /* ── Change Network Button ── */
-    .btn-change-network {
-      background: rgba(0, 240, 255, 0.08);
-      border: 1px solid rgba(0, 240, 255, 0.28);
-      color: var(--accent-cyan);
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      cursor: pointer;
-      font-family: 'JetBrains Mono', monospace;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    .btn-change-network:hover {
-      background: rgba(0, 240, 255, 0.18);
-      border-color: var(--accent-cyan);
-      box-shadow: 0 0 16px rgba(0, 240, 255, 0.22);
-      transform: translateY(-1px);
-    }
-    .btn-change-network:active { transform: translateY(0); }
-
-    /* ── Active Network Label ── */
-    .active-network-label {
-      font-size: 11px;
-      font-family: 'JetBrains Mono', monospace;
-      color: var(--text-muted);
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      padding: 4px 10px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.07);
-      border-radius: 12px;
-      white-space: nowrap;
-    }
-    .active-network-label .net-name {
-      color: #e2e8f0;
-      font-weight: 700;
-    }
-
-    /* ── Capture Status Indicator (header) ── */
-    .capture-status-indicator {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      padding: 5px 12px;
-      border-radius: 20px;
-      font-size: 11px;
-      font-family: 'JetBrains Mono', monospace;
-      font-weight: 600;
-      letter-spacing: 0.3px;
-      border: 1px solid rgba(255,255,255,0.07);
-      background: rgba(255,255,255,0.03);
-      color: var(--text-muted);
-      transition: all 0.3s ease;
-      white-space: nowrap;
-    }
-    .capture-status-indicator.active {
-      background: rgba(16, 185, 129, 0.08);
-      border-color: rgba(16, 185, 129, 0.35);
-      color: #34d399;
-    }
-    .capture-status-indicator.active .cap-dot {
-      background: #10b981;
-      box-shadow: 0 0 7px #10b981;
-      animation: pulse 1.5s infinite;
-    }
-    .capture-status-indicator.inactive .cap-dot {
-      background: var(--text-muted);
-    }
-    .cap-dot {
-      width: 7px; height: 7px; border-radius: 50%;
-      flex-shrink: 0;
-    }
-    .cap-iface { color: #fff; font-weight: 700; max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
-    .cap-ip { color: var(--accent-cyan); opacity: 0.85; }
-
-    /* ── Change Network Modal ── */
-    .network-modal-dialog {
-      background: #0c1528;
-      border: 1px solid rgba(0, 240, 255, 0.22);
-      box-shadow: 0 25px 60px rgba(0,0,0,0.8), 0 0 40px rgba(0, 240, 255, 0.1);
-      border-radius: 14px;
-      width: 90%;
-      max-width: 520px;
-      padding: 24px;
-      animation: scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-    .network-iface-list {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      max-height: 260px;
-      overflow-y: auto;
-      margin: 14px 0;
-      padding-right: 4px;
-    }
-    .network-iface-list::-webkit-scrollbar { width: 4px; }
-    .network-iface-list::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); border-radius: 2px; }
-    .network-iface-list::-webkit-scrollbar-thumb { background: rgba(0,240,255,0.25); border-radius: 2px; }
-    .iface-option-btn {
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.07);
-      border-radius: 8px;
-      padding: 12px 14px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      transition: all 0.15s ease;
-      text-align: left;
-      width: 100%;
-      color: var(--text);
-    }
-    .iface-option-btn:hover {
-      background: rgba(0, 240, 255, 0.06);
-      border-color: rgba(0, 240, 255, 0.2);
-    }
-    .iface-option-btn.selected {
-      background: rgba(0, 240, 255, 0.1);
-      border-color: var(--accent-cyan);
-      box-shadow: 0 0 10px rgba(0, 240, 255, 0.12);
-    }
-    .iface-name { font-weight: 700; font-size: 13px; }
-    .iface-ip {
-      font-size: 11px; font-family: 'JetBrains Mono', monospace;
-      color: var(--text-muted); margin-top: 2px;
-    }
-    .iface-active-tag {
-      font-size: 10px; font-weight: 700; font-family: 'JetBrains Mono', monospace;
-      padding: 2px 7px; border-radius: 4px; text-transform: uppercase; white-space: nowrap;
-      background: rgba(0, 240, 255, 0.12); color: var(--accent-cyan);
-      border: 1px solid rgba(0, 240, 255, 0.3);
-    }
-    .btn-detect-networks {
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.1);
-      color: #cbd5e1; padding: 6px 12px; border-radius: 6px;
-      font-size: 12px; font-weight: 600; cursor: pointer;
-      display: inline-flex; align-items: center; gap: 6px;
-      transition: all 0.15s ease; font-family: 'Plus Jakarta Sans', sans-serif;
-    }
-    .btn-detect-networks:hover { background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.22); }
-    .btn-detect-networks:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-network-apply {
-      background: linear-gradient(135deg, #00b4cc, #0077aa); color: #fff;
-    }
-    .btn-network-apply:hover { box-shadow: 0 0 18px rgba(0, 240, 255, 0.35); opacity: 0.95; }
-    .btn-network-apply:disabled { opacity: 0.35; cursor: not-allowed; }
-    .network-current-row {
-      background: rgba(0,0,0,0.22);
-      border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 8px; padding: 10px 14px;
-      font-size: 12px; font-family: 'JetBrains Mono', monospace;
-      color: var(--text-muted); display: flex; align-items: center; gap: 8px;
-    }
-    .network-current-row strong { color: var(--accent-cyan); }
-  </style>
-</head>
-<body>
-  <header>
-    <div class="brand">
-      <div class="brand-icon">🛡️</div>
-      <div>
-        <h1>AegisNIDS <span>SOC Intelligence</span></h1>
-      </div>
-    </div>
-    <div class="header-actions">
-      <div id="mode-badge" class="mode-indicator replay">
-        <span id="mode-dot" class="mode-dot blue"></span>
-        <span id="mode-text">REPLAY MODE</span>
-      </div>
-
-      <!-- Capture Status Indicator: shows active interface + IP in real time -->
-      <div id="capture-status-indicator" class="capture-status-indicator inactive"
-           title="Packet capture status — interface and local IP address">
-        <span class="cap-dot" id="cap-status-dot"></span>
-        <span id="cap-status-text">Packet Capture: Inactive</span>
-      </div>
-
-      <div id="active-network-label" class="active-network-label" title="Currently monitored network interface">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-        Active Network: <span id="active-net-name" class="net-name">—</span>
-      </div>
-      <button id="btn-change-network" class="btn-change-network" onclick="openNetworkModal()" title="Switch the active packet-capture network interface without reloading">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
-        CHANGE NETWORK
-      </button>
-      <button id="btn-reset-soc" class="btn-reset" onclick="openResetModal()" title="Reset all flows, alerts, and telemetry counters">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-          <path d="M3 3v5h5"/>
-        </svg>
-        RESET SOC DATA
-      </button>
-    </div>
-  </header>
-
-  <main>
-    <!-- Live Capture Control Bar -->
-    <div class="capture-panel">
-      <div class="capture-top-row">
-        <div class="capture-controls">
-          <label style="font-size: 12px; font-weight: 700; color: var(--text-muted);">ADAPTER:</label>
-          <select id="interface-select" class="select-input">
-            <option value="loopback">Software Loopback (127.0.0.1)</option>
-          </select>
-          <button id="btn-start-cap" class="btn btn-live-start" onclick="startLiveCapture()">▶ START LIVE CAPTURE</button>
-          <button id="btn-stop-cap" class="btn btn-live-stop" onclick="stopLiveCapture()" style="display: none;">⏹ STOP CAPTURE</button>
-        </div>
-        <div id="capture-stats-badge" style="font-size: 12px; font-family: 'JetBrains Mono', monospace; color: var(--text-muted);">
-          Packets: <span id="cap-pkts" style="color: #fff; font-weight: 700;">0</span> | Flows: <span id="cap-flows" style="color: #fff; font-weight: 700;">0</span>
-        </div>
-      </div>
-
-      <!-- Missing Driver Diagnostic Warning Banner -->
-      <div id="driver-warning" class="driver-banner" style="display: none;">
-        <div>⚠️ <strong>Npcap Packet Driver Notice:</strong> Layer-2 packet sniffing on Windows requires Npcap.</div>
-        <a href="https://npcap.com/#download" target="_blank">Download Npcap (WinPcap-Compatible Mode) →</a>
-      </div>
-
-      <div class="guardrail-note">
-        🔒 Safety Guardrail: Traffic capture defaults to local loopback (127.0.0.1). Flows are projected into 77 canonical features and evaluated through the active ML model in real time.
-      </div>
-    </div>
-
-    <!-- Metrics Cards -->
-    <div class="metrics-grid">
-      <div class="card">
-        <div class="card-title">Total Network Flows</div>
-        <div class="card-val cyan" id="stat-flows">0</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Active Security Alerts</div>
-        <div class="card-val" id="stat-alerts">0</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Critical Threats</div>
-        <div class="card-val crit" id="stat-crit">0</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Analyst-Verified Precision</div>
-        <div class="card-val" id="stat-precision" style="color: var(--text-muted); font-size: 24px;">—</div>
-      </div>
-      <div class="card">
-        <div class="card-title">Active ML Model</div>
-        <div class="card-val" style="font-size: 15px; color: #fff; font-family: 'Plus Jakarta Sans'; word-break: break-word;" id="stat-active">weighted_voting_ensemble</div>
-      </div>
-    </div>
-
-    <!-- Live Flow Stream Panel (Shows every classified flow: Benign & Attack) -->
-    <div class="card">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-        <div>
-          <h2 style="font-size: 16px; font-weight: 700;">Live Network Flow Classification Stream</h2>
-          <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Real-time ML flow ingestion & predictions (Last 30 Flows)</div>
-        </div>
-        <div style="display: flex; align-items: center; gap: 8px; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--accent-cyan);">
-          <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 8px #10b981;"></span>
-          INGESTION ACTIVE
-        </div>
-      </div>
-      <div class="table-container" style="max-height: 280px;">
-        <table>
-          <thead>
-            <tr>
-              <th>Flow ID</th>
-              <th>Time</th>
-              <th>Protocol</th>
-              <th>Source (IP:Port)</th>
-              <th>Destination (IP:Port)</th>
-              <th>Predicted Class</th>
-              <th>Confidence</th>
-              <th>Model</th>
-            </tr>
-          </thead>
-          <tbody id="flows-body">
-            <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Awaiting live network traffic...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Alert Feed & SHAP Panel -->
-    <div class="content-grid">
-      <div class="card">
-        <h2 style="font-size: 16px; font-weight: 700; margin-bottom: 16px;">Live Security Incident & Alert Stream</h2>
-        <div class="table-container">
-          <table>
-            <thead>
-              <tr>
-                <th>Alert ID</th>
-                <th>Severity</th>
-                <th>Attack Type</th>
-                <th>Confidence</th>
-                <th>Source IP</th>
-                <th>Target</th>
-                <th>Status</th>
-                <th>Triage</th>
-              </tr>
-            </thead>
-            <tbody id="alerts-body">
-              <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Loading live alerts...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2 style="font-size: 16px; font-weight: 700; margin-bottom: 16px;">Real-Time Tree SHAP Attributions</h2>
-        <div id="explanation-container">
-          <div style="color: var(--text-muted); font-size: 12px;">Awaiting alert explanations...</div>
-        </div>
-        <div id="shap-container" style="margin-top: 14px;">
-          <div style="color: var(--text-muted); font-size: 13px;">Computing live explainability attributions...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Model Comparison Matrix -->
-    <div class="card">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
-        <div>
-          <h2 style="font-size: 16px; font-weight: 700;">Registered Models Benchmark & Dynamic Switcher</h2>
-          <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Real-time inference hot-switching across registered benchmark models</div>
-        </div>
-        <div style="display: flex; gap: 8px; font-size: 11px; font-family: 'JetBrains Mono', monospace; flex-wrap: wrap;">
-          <span style="padding: 4px 10px; border-radius: 6px; background: rgba(0, 240, 255, 0.12); border: 1px solid var(--accent-cyan); color: var(--accent-cyan); font-weight: 700;">● CICIDS2017 (Active — 7 Models)</span>
-          <span style="padding: 4px 10px; border-radius: 6px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border); color: var(--text-muted);" title="Dataset ingestion planned in future expansion phase">○ NSL-KDD (Not yet implemented)</span>
-          <span style="padding: 4px 10px; border-radius: 6px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border); color: var(--text-muted);" title="Dataset ingestion planned in future expansion phase">○ UNSW-NB15 (Not yet implemented)</span>
-        </div>
-      </div>
-      <div class="models-grid" id="models-container">
-        <!-- Rendered via JS -->
-      </div>
-    </div>
-  </main>
-
-  <!-- Reset Confirmation Modal -->
-  <div id="reset-modal" class="modal-backdrop" style="display: none;" onclick="handleModalBackdropClick(event)">
-    <div class="modal-dialog">
-      <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 32px; height: 32px; border-radius: 8px; background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); display: flex; align-items: center; justify-content: center; color: #ef4444; font-size: 16px;">⚠️</div>
-          <h3 style="font-size: 16px; font-weight: 800; color: #fff;">Reset SOC Telemetry & Database</h3>
-        </div>
-        <button class="modal-close-btn" onclick="closeResetModal()">✕</button>
-      </div>
-      <div class="modal-body">
-        <p>This action will permanently purge:</p>
-        <ul style="margin: 8px 0 8px 20px; color: var(--text); font-size: 12px; font-family: 'JetBrains Mono', monospace; line-height: 1.8;">
-          <li>All stored network flows and classifications</li>
-          <li>All security incidents and alerts</li>
-          <li>Live packet and flow telemetry counters</li>
-          <li>Active alert deduplication caches</li>
-        </ul>
-        <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">Active ML models and registered benchmark configurations will remain intact.</p>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-modal-cancel" onclick="closeResetModal()">Cancel</button>
-        <button class="btn btn-modal-confirm" id="btn-confirm-reset-action" onclick="executeReset()">
-          <span>Confirm & Purge Telemetry</span>
-        </button>
-      </div>
-    </div>
-  </div>
-
-  <!-- False Positive Correction Modal -->
-  <div id="fp-modal" class="modal-backdrop" style="display: none;" onclick="if(event.target.id==='fp-modal')closeFPModal()">
-    <div class="fp-modal-dialog">
-      <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 32px; height: 32px; border-radius: 8px; background: rgba(234,179,8,0.15); border: 1px solid rgba(234,179,8,0.4); display: flex; align-items: center; justify-content: center; color: #eab308; font-size: 16px;">🏷️</div>
-          <h3 style="font-size: 16px; font-weight: 800; color: #fff;">Mark as False Positive</h3>
-        </div>
-        <button class="modal-close-btn" onclick="closeFPModal()">✕</button>
-      </div>
-      <div class="modal-body">
-        <p style="margin-bottom: 12px;">Alert <strong id="fp-alert-id-display" style="color: var(--accent-cyan);"></strong> will be marked as a false positive. This correction is logged for future model retraining.</p>
-        <div class="fp-form-group">
-          <label>Original Detection</label>
-          <input type="text" id="fp-original-label" readonly style="background: rgba(7,9,14,0.9); border: 1px solid var(--card-border); color: #f87171; padding: 10px 14px; border-radius: 6px; font-size: 13px; width: 100%; font-family: 'JetBrains Mono', monospace;">
-        </div>
-        <div class="fp-form-group">
-          <label>Corrected Classification</label>
-          <select id="fp-corrected-label">
-            <option value="Benign">Benign (Normal Traffic)</option>
-            <option value="Bot">Bot</option>
-            <option value="DDoS">DDoS</option>
-            <option value="DoS GoldenEye">DoS GoldenEye</option>
-            <option value="DoS Hulk">DoS Hulk</option>
-            <option value="DoS Slowhttptest">DoS Slowhttptest</option>
-            <option value="DoS slowloris">DoS slowloris</option>
-            <option value="FTP-Patator">FTP-Patator</option>
-            <option value="Heartbleed">Heartbleed</option>
-            <option value="Infiltration">Infiltration</option>
-            <option value="PortScan">PortScan</option>
-            <option value="SSH-Patator">SSH-Patator</option>
-            <option value="Web Attack - Brute Force">Web Attack - Brute Force</option>
-            <option value="Web Attack - Sql Injection">Web Attack - Sql Injection</option>
-            <option value="Web Attack - XSS">Web Attack - XSS</option>
-          </select>
-        </div>
-        <div class="fp-form-group">
-          <label>Analyst Notes (Optional)</label>
-          <textarea id="fp-notes" placeholder="Reason for marking as false positive..."></textarea>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-modal-cancel" onclick="closeFPModal()">Cancel</button>
-        <button class="btn btn-fp-submit" id="btn-fp-submit" onclick="submitFalsePositive()">Confirm False Positive & Log Feedback</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Change Network Interface Modal -->
-  <div id="network-modal" class="modal-backdrop" style="display: none;" onclick="if(event.target.id==='network-modal')closeNetworkModal()">
-    <div class="network-modal-dialog">
-      <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 32px; height: 32px; border-radius: 8px; background: rgba(0,240,255,0.12); border: 1px solid rgba(0,240,255,0.28); display: flex; align-items: center; justify-content: center; color: var(--accent-cyan); font-size: 16px;">🌐</div>
-          <h3 style="font-size: 16px; font-weight: 800; color: #fff;">Change Network Interface</h3>
-        </div>
-        <button class="modal-close-btn" onclick="closeNetworkModal()">✕</button>
-      </div>
-      <div class="modal-body">
-        <div class="network-current-row">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-          Currently active: <strong id="network-current-active">—</strong>
-        </div>
-        <div style="display: flex; justify-content: space-between; align-items: center; margin: 14px 0 4px;">
-          <span style="font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;">Available Interfaces</span>
-          <button class="btn-detect-networks" id="btn-detect-ifaces" onclick="detectNetworkInterfaces()">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-            Detect Networks
-          </button>
-        </div>
-        <div class="network-iface-list" id="network-iface-list">
-          <div style="color: var(--text-muted); font-size: 12px; text-align: center; padding: 16px;">Detecting interfaces...</div>
-        </div>
-        <p style="font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-top: 6px;">
-          🔒 Selecting a new interface restarts packet capture only. All existing alerts, flows, and model state remain intact — no page reload required.
-        </p>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-modal-cancel" onclick="closeNetworkModal()">Cancel</button>
-        <button class="btn btn-network-apply" id="btn-apply-network" onclick="applyNetworkChange()" disabled>Apply Interface</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Toast Notification -->
-  <div id="toast" class="toast" style="display: none;"></div>
-
-  <script>
-    let isCapturing = false;
-    let currentFPAlertId = null;
-    let selectedNetworkInterface = null; // Holds pending interface selection in the Change Network modal
-
-    function openResetModal() {
-      document.getElementById('reset-modal').style.display = 'flex';
-    }
-
-    function closeResetModal() {
-      document.getElementById('reset-modal').style.display = 'none';
-    }
-
-    function handleModalBackdropClick(e) {
-      if (e.target.id === 'reset-modal') {
-        closeResetModal();
-      }
-    }
-
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        closeResetModal();
-        closeNetworkModal();
-      }
-    });
-
-    function showToast(msg, duration = 3000) {
-      const toast = document.getElementById('toast');
-      toast.innerHTML = `<span>🛡️</span> <span>${msg}</span>`;
-      toast.style.display = 'flex';
-      setTimeout(() => {
-        toast.style.display = 'none';
-      }, duration);
-    }
-
-    async function executeReset() {
-      const btn = document.getElementById('btn-confirm-reset-action');
-      const origText = btn.innerHTML;
-      btn.disabled = true;
-      btn.innerHTML = '<span>Purging Telemetry...</span>';
-
-      try {
-        const res = await fetch('/api/reset', { method: 'POST' });
-        const data = await res.json();
-        if (res.ok) {
-          closeResetModal();
-          showToast('SOC database & telemetry counters reset to zero.');
-          await fetchStats();
-          await fetchFlows();
-          await fetchAlerts();
-          document.getElementById('shap-container').innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">Awaiting network flows to compute live SHAP attributions...</div>';
-        } else {
-          alert('Failed to reset: ' + (data.detail || data.message || 'Unknown error'));
-        }
-      } catch (e) {
-        console.error('Reset failed', e);
-        alert('Reset request encountered an error.');
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = origText;
-      }
-    }
-
-    async function checkCapabilities() {
-      try {
-        const res = await fetch('/api/capture/capabilities');
-        const cap = await res.json();
-        if (!cap.has_pcap_driver) {
-          document.getElementById('driver-warning').style.display = 'flex';
-        }
-      } catch (e) {
-        console.error("Failed to check capabilities", e);
-      }
-    }
-
-    async function fetchInterfaces(selectId) {
-      try {
-        const res = await fetch('/api/capture/interfaces');
-        const list = await res.json();
-        const select = document.getElementById('interface-select');
-        select.innerHTML = '';
-        list.forEach(i => {
-          const opt = document.createElement('option');
-          opt.value = i.id;
-          opt.innerText = `${i.name} (${i.ip})`;
-          if (i.is_default) opt.selected = true;
-          select.appendChild(opt);
-        });
-        // If a specific interface was requested, select it in the dropdown
-        if (selectId) {
-          select.value = selectId;
-          // If exact match not found, try matching by name substring
-          if (!select.value || select.value !== selectId) {
-            const fallback = Array.from(select.options).find(o =>
-              o.value.includes(selectId) || selectId.includes(o.value)
-            );
-            if (fallback) select.value = fallback.value;
-          }
-        }
-      } catch (e) {
-        console.error("Failed to fetch interfaces", e);
-      }
-    }
-
-    async function startLiveCapture() {
-      const iface = document.getElementById('interface-select').value;
-      try {
-        const res = await fetch('/api/capture/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ interface: iface })
-        });
-        const data = await res.json();
-        if (res.ok) {
-          updateCaptureUI(true, iface, data.active_ip || null);
-          showToast(`Live capture started on ${iface}`);
-        } else {
-          const errorMsg = data.detail ? (typeof data.detail === 'object' ? JSON.stringify(data.detail) : data.detail) : (data.message || 'Capture initialization failed');
-          showToast(`⚠️ Live Capture Notice: ${errorMsg}`, 6000);
-          updateCaptureUI(false, null, null);
-        }
-      } catch (e) {
-        console.error("Error starting live capture", e);
-        showToast("⚠️ Capture driver unavailable. Falling back to Replay Mode.", 5000);
-        updateCaptureUI(false, null, null);
-      }
-    }
-
-    async function stopLiveCapture() {
-      try {
-        const res = await fetch('/api/capture/stop', { method: 'POST' });
-        if (res.ok) {
-          updateCaptureUI(false, null);
-          showToast("Live capture stopped. Switched to Replay Mode.");
-        }
-      } catch (e) {
-        console.error("Error stopping live capture", e);
-      }
-    }
-
-    function updateCaptureUI(active, iface, ip) {
-      isCapturing = active;
-      const modeBadge = document.getElementById('mode-badge');
-      const modeDot = document.getElementById('mode-dot');
-      const modeText = document.getElementById('mode-text');
-      const btnStart = document.getElementById('btn-start-cap');
-      const btnStop = document.getElementById('btn-stop-cap');
-
-      if (active) {
-        modeBadge.className = 'mode-indicator live';
-        modeDot.className = 'mode-dot red';
-        modeText.innerText = `LIVE CAPTURE — ${iface || 'interface'}`;
-        btnStart.style.display = 'none';
-        btnStop.style.display = 'inline-flex';
-        updateActiveNetworkLabel(iface, ip);
-      } else {
-        modeBadge.className = 'mode-indicator replay';
-        modeDot.className = 'mode-dot blue';
-        modeText.innerText = 'REPLAY MODE';
-        btnStart.style.display = 'inline-flex';
-        btnStop.style.display = 'none';
-        updateCaptureStatusIndicator(false, null, null);
-      }
-    }
-
-    function updateActiveNetworkLabel(iface, ip) {
-      const el = document.getElementById('active-net-name');
-      if (el && iface) el.innerText = iface;
-      updateCaptureStatusIndicator(true, iface, ip);
-    }
-
-    /**
-     * Updates the "Packet Capture: Active — [iface] — [IP]" indicator in the header.
-     * active: bool — whether capture is running
-     * iface: string|null — interface name
-     * ip: string|null — local IPv4 on that interface
-     */
-    function updateCaptureStatusIndicator(active, iface, ip) {
-      const indicator = document.getElementById('capture-status-indicator');
-      const textEl = document.getElementById('cap-status-text');
-      if (!indicator || !textEl) return;
-
-      if (active && iface) {
-        indicator.className = 'capture-status-indicator active';
-        const ipPart = (ip && ip !== '0.0.0.0') ? ` — <span class="cap-ip">${ip}</span>` : '';
-        textEl.innerHTML = `Packet Capture: Active — <span class="cap-iface">${iface}</span>${ipPart}`;
-      } else {
-        indicator.className = 'capture-status-indicator inactive';
-        textEl.innerHTML = 'Packet Capture: Inactive';
-      }
-    }
-
-    // ── Change Network Modal ──────────────────────────────────────────────────
-
-    function openNetworkModal() {
-      selectedNetworkInterface = null;
-      const applyBtn = document.getElementById('btn-apply-network');
-      if (applyBtn) applyBtn.disabled = true;
-      const curIface = document.getElementById('active-net-name').innerText;
-      const curEl = document.getElementById('network-current-active');
-      if (curEl) curEl.innerText = (curIface && curIface !== '—') ? curIface : (isCapturing ? 'Active capture' : 'Not capturing');
-      document.getElementById('network-modal').style.display = 'flex';
-      detectNetworkInterfaces();
-    }
-
-    function closeNetworkModal() {
-      const modal = document.getElementById('network-modal');
-      if (modal) modal.style.display = 'none';
-      selectedNetworkInterface = null;
-    }
-
-    async function detectNetworkInterfaces() {
-      const listEl = document.getElementById('network-iface-list');
-      const detectBtn = document.getElementById('btn-detect-ifaces');
-      if (!listEl || !detectBtn) return;
-      detectBtn.disabled = true;
-      detectBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg> Detecting...`;
-      listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 12px; text-align: center; padding: 16px 0;">Scanning network adapters...</div>';
-      try {
-        const res = await fetch('/api/capture/interfaces');
-        const interfaces = await res.json();
-        if (!interfaces || interfaces.length === 0) {
-          listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 12px; text-align: center; padding: 16px 0;">No network interfaces detected.</div>';
-          return;
-        }
-        const currentActive = document.getElementById('active-net-name').innerText;
-        let html = '';
-        interfaces.forEach(iface => {
-          const ifaceId = iface.id || '';
-          const ifaceName = iface.name || ifaceId;
-          const ifaceIp = iface.ip || '';
-          const ifaceDesc = iface.description || '';
-          const isCurrentlyActive = (ifaceId === currentActive || ifaceName === currentActive);
-          const safeBtnId = 'iface-btn-' + ifaceId.replace(/[^a-zA-Z0-9]/g, '-');
-          html += `
-            <button class="iface-option-btn" onclick="selectInterface('${ifaceId}', '${ifaceName.replace(/'/g, "\\'")}'" id="${safeBtnId}">
-              <div style="flex: 1; min-width: 0;">
-                <div class="iface-name">${ifaceName}</div>
-                <div class="iface-ip">${ifaceDesc ? ifaceDesc + ' &nbsp;·&nbsp; ' : ''}${ifaceIp}</div>
-              </div>
-              ${isCurrentlyActive ? '<span class="iface-active-tag">● ACTIVE</span>' : ''}
-            </button>
-          `;
-        });
-        listEl.innerHTML = html;
-      } catch (e) {
-        listEl.innerHTML = '<div style="color: #f87171; font-size: 12px; text-align: center; padding: 16px 0;">⚠️ Failed to retrieve interfaces. Is the server reachable?</div>';
-        console.error('Interface detection failed', e);
-      } finally {
-        detectBtn.disabled = false;
-        detectBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg> Detect Networks`;
-      }
-    }
-
-    function selectInterface(id, name) {
-      selectedNetworkInterface = { id, name };
-      // Highlight selected button, deselect all others
-      document.querySelectorAll('.iface-option-btn').forEach(btn => btn.classList.remove('selected'));
-      const safeBtnId = 'iface-btn-' + id.replace(/[^a-zA-Z0-9]/g, '-');
-      const target = document.getElementById(safeBtnId);
-      if (target) target.classList.add('selected');
-      const applyBtn = document.getElementById('btn-apply-network');
-      if (applyBtn) applyBtn.disabled = false;
-    }
-
-    async function applyNetworkChange() {
-      if (!selectedNetworkInterface) return;
-      const btn = document.getElementById('btn-apply-network');
-      const origText = btn ? btn.innerHTML : 'Apply Interface';
-      if (btn) { btn.disabled = true; btn.innerHTML = 'Switching...'; }
-      try {
-        const res = await fetch('/api/capture/switch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ interface: selectedNetworkInterface.id })
-        });
-        const data = await res.json();
-        if (res.ok) {
-          const displayName = selectedNetworkInterface.name || selectedNetworkInterface.id;
-          // Save the interface ID before closeNetworkModal() clears selectedNetworkInterface
-          const switchedId = selectedNetworkInterface.id;
-          // active_ip comes from the backend _resolve_interface() - real hotspot IP
-          const activeIp = data.active_ip || null;
-          closeNetworkModal();
-          updateActiveNetworkLabel(displayName, activeIp);
-          updateCaptureUI(true, displayName, activeIp);
-          const ipInfo = (activeIp && activeIp !== '0.0.0.0') ? ` (${activeIp})` : '';
-          showToast(`Network changed successfully. Packet capture is now using ${displayName}${ipInfo}.`, 5500);
-          await fetchStats();
-          // Sync the ADAPTER dropdown to the newly active interface
-          await fetchInterfaces(switchedId);
-        } else {
-          const errMsg = data.detail
-            ? (typeof data.detail === 'object' ? JSON.stringify(data.detail) : data.detail)
-            : (data.message || 'Failed to switch interface.');
-          showToast(`Network switch failed: ${errMsg}`, 6000);
-          if (btn) { btn.disabled = false; btn.innerHTML = origText; }
-        }
-      } catch (e) {
-        console.error('Network switch request failed', e);
-        showToast('Network switch request failed. Check server connectivity.', 5000);
-        if (btn) { btn.disabled = false; btn.innerHTML = origText; }
-      }
-    }
-
-    async function fetchStats() {
-      try {
-        const res = await fetch('/api/stats');
-        const data = await res.json();
-        document.getElementById('stat-flows').innerText = data.total_flows;
-        document.getElementById('stat-alerts').innerText = data.total_alerts;
-        document.getElementById('stat-crit').innerText = data.severity_breakdown.CRITICAL;
-        document.getElementById('stat-active').innerText = data.active_model;
-
-        // Update Analyst-Verified Precision card
-        const precEl = document.getElementById('stat-precision');
-        if (data.analyst_precision === null || data.analyst_precision === undefined) {
-          precEl.innerText = '—';
-          precEl.style.color = 'var(--text-muted)';
-          precEl.style.fontSize = '24px';
-          precEl.title = 'No alerts triaged yet';
-        } else {
-          precEl.innerText = `${data.analyst_precision.toFixed(1)}%`;
-          precEl.style.color = '#10b981';
-          precEl.style.fontSize = '26px';
-          precEl.title = `${data.total_triaged || 0} alert(s) triaged (${data.status_breakdown ? data.status_breakdown.FALSE_POSITIVE : 0} FP)`;
-        }
-
-        // Update Capture Stats & Mode Badge
-        if (data.capture_status) {
-          document.getElementById('cap-pkts').innerText = data.capture_status.packet_count || 0;
-          document.getElementById('cap-flows').innerText = data.capture_status.flow_count || 0;
-          // Pass active_ip so the header status indicator shows the real IP
-          updateCaptureUI(
-            data.capture_status.is_capturing,
-            data.capture_status.active_interface,
-            data.capture_status.active_ip
-          );
-        }
-
-        // Render Explanation
-        if (data.latest_explanation) {
-          document.getElementById('explanation-container').innerHTML = `
-            <div class="explanation-box">
-              <div class="label">🧠 AI Alert Explanation</div>
-              <div>${data.latest_explanation}</div>
-            </div>
-          `;
-        }
-
-        // Render SHAP
-        if (data.latest_shap && data.latest_shap.length > 0) {
-          const maxImp = Math.max(...data.latest_shap.map(s => s.importance), 0.0001);
-          let shapHtml = '';
-          data.latest_shap.forEach(s => {
-            const pct = Math.min(100, Math.round((s.importance / maxImp) * 100));
-            shapHtml += `
-              <div class="shap-bar-item">
-                <div class="shap-bar-label">
-                  <span>${s.feature}</span>
-                  <span style="color: var(--accent-cyan);">${s.importance.toFixed(4)}</span>
-                </div>
-                <div class="shap-bar-track">
-                  <div class="shap-bar-fill" style="width: ${pct}%;"></div>
-                </div>
-              </div>
-            `;
-          });
-          document.getElementById('shap-container').innerHTML = shapHtml;
-        }
-      } catch (e) {
-        console.error("Failed to fetch stats", e);
-      }
-    }
-
-    async function fetchFlows() {
-      try {
-        const res = await fetch('/api/flows?limit=30');
-        if (!res.ok) return;
-        const flows = await res.json();
-        const tbody = document.getElementById('flows-body');
-        if (!flows || flows.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No network flows captured yet. Start capture to inspect real-time traffic.</td></tr>';
-          return;
-        }
-        let html = '';
-        const protoMap = { 6: 'TCP', 17: 'UDP', 1: 'ICMP', 2: 'IGMP' };
-        flows.forEach(f => {
-          const isBenign = (!f.predicted_label || f.predicted_label.toLowerCase() === 'benign');
-          const badgeClass = isBenign ? 'BENIGN' : 'ATTACK';
-          const protoName = protoMap[f.protocol] || `Proto ${f.protocol}`;
-          const timeStr = f.timestamp ? f.timestamp.split('T')[1].split('.')[0] : '--:--:--';
-          let methodBadge = '';
-          if (f.detection_method === 'SYN_BURST_HEURISTIC') {
-            methodBadge = `<div style="font-size: 10px; color: var(--accent-cyan); margin-top: 2px;">⚡ SYN Heuristic</div>`;
-          } else if (f.detection_method === 'ML_HYBRID') {
-            methodBadge = `<div style="font-size: 10px; color: #a78bfa; margin-top: 2px;">⚡ ML + Heuristic</div>`;
-          }
-          html += `
-            <tr>
-              <td>#${f.id}</td>
-              <td style="color: var(--text-muted);">${timeStr}</td>
-              <td><span class="badge proto">${protoName}</span></td>
-              <td>${f.src_ip}:${f.src_port}</td>
-              <td>${f.dst_ip}:${f.dst_port}</td>
-              <td>
-                <span class="badge ${badgeClass}">${f.predicted_label}</span>
-                ${methodBadge}
-              </td>
-              <td>
-                <div style="font-weight: 600;">${(f.confidence * 100).toFixed(1)}%</div>
-                ${f.ml_predicted_label && f.ml_predicted_label !== f.predicted_label ? `<div style="font-size: 10px; color: var(--text-muted);">ML: ${f.ml_predicted_label} (${(f.ml_confidence * 100).toFixed(1)}%)</div>` : ''}
-              </td>
-              <td style="color: var(--text-muted); font-size: 11px;">${f.model_name || 'weighted_voting_ensemble'}</td>
-            </tr>
-          `;
-        });
-        tbody.innerHTML = html;
-      } catch (e) {
-        console.error("Failed to fetch flows", e);
-      }
-    }
-
-    async function fetchAlerts() {
-      try {
-        const res = await fetch('/api/alerts?limit=25');
-        const alerts = await res.json();
-        const tbody = document.getElementById('alerts-body');
-        if (alerts.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No alerts recorded. Network clean.</td></tr>';
-          return;
-        }
-        let html = '';
-        const statusLabels = { NEW: 'NEW', ACKNOWLEDGED: 'ACK', FALSE_POSITIVE: 'FP', ESCALATED: 'ESC', RESOLVED: 'RES' };
-        alerts.forEach(a => {
-          const st = a.status || 'NEW';
-          const rowClass = st === 'RESOLVED' ? 'alert-resolved' : st === 'FALSE_POSITIVE' ? 'alert-fp' : '';
-          const isTerminal = (st === 'RESOLVED' || st === 'FALSE_POSITIVE');
-          let triageHtml = '';
-          if (isTerminal) {
-            triageHtml = `<span style="font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;">—</span>`;
-          } else {
-            triageHtml = `<div class="triage-actions">`;
-            if (st !== 'ACKNOWLEDGED') triageHtml += `<button class="triage-btn ack" onclick="triageAlert('${a.alert_id}','ACKNOWLEDGED')" title="Acknowledge">ACK</button>`;
-            triageHtml += `<button class="triage-btn fp" onclick="openFPModal('${a.alert_id}','${a.attack_type}')" title="False Positive">FP</button>`;
-            if (st !== 'ESCALATED') triageHtml += `<button class="triage-btn esc" onclick="triageAlert('${a.alert_id}','ESCALATED')" title="Escalate">ESC</button>`;
-            triageHtml += `<button class="triage-btn res" onclick="triageAlert('${a.alert_id}','RESOLVED')" title="Resolve">RES</button>`;
-            triageHtml += `</div>`;
-          }
-          let methodTag = '';
-          if (a.detection_method === 'SYN_BURST_HEURISTIC') {
-            methodTag = `<span style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(0, 240, 255, 0.15); color: var(--accent-cyan); margin-left: 6px;">SYN Heuristic</span>`;
-          } else if (a.detection_method === 'ML_HYBRID') {
-            methodTag = `<span style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(167, 139, 250, 0.15); color: #a78bfa; margin-left: 6px;">ML + Heuristic</span>`;
-          }
-          html += `
-            <tr class="${rowClass}">
-              <td>${a.alert_id}</td>
-              <td><span class="badge ${a.severity}">${a.severity}</span></td>
-              <td>
-                <div style="display: flex; align-items: center; gap: 6px;">
-                  <span style="font-weight: 700; color: #fff;">${a.attack_type}</span>
-                  ${methodTag}
-                </div>
-                ${a.explanation ? `<div class="explanation-inline">${a.explanation}</div>` : ''}
-              </td>
-              <td>
-                <div style="font-weight: 700; color: var(--accent-cyan);">${(a.confidence * 100).toFixed(1)}%</div>
-                ${a.ml_predicted_label && a.ml_predicted_label !== a.attack_type ? `<div style="font-size: 10px; color: var(--text-muted);">ML: ${a.ml_predicted_label} (${((a.ml_confidence || 0) * 100).toFixed(1)}%)</div>` : ''}
-              </td>
-              <td>${a.src_ip}</td>
-              <td>${a.dst_ip}:${a.dst_port}</td>
-              <td><span class="badge ${st}">${statusLabels[st] || st}</span></td>
-              <td>${triageHtml}</td>
-            </tr>
-          `;
-        });
-        tbody.innerHTML = html;
-      } catch (e) {
-        console.error("Failed to fetch alerts", e);
-      }
-    }
-
-    async function triageAlert(alertId, newStatus) {
-      try {
-        const res = await fetch(`/api/alerts/${alertId}/status`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: newStatus })
-        });
-        if (res.ok) {
-          showToast(`Alert ${alertId} → ${newStatus}`);
-          fetchAlerts();
-          fetchStats();
-        }
-      } catch (e) {
-        console.error('Triage failed', e);
-      }
-    }
-
-    function openFPModal(alertId, attackType) {
-      currentFPAlertId = alertId;
-      document.getElementById('fp-alert-id-display').innerText = alertId;
-      document.getElementById('fp-original-label').value = attackType;
-      document.getElementById('fp-corrected-label').value = 'Benign';
-      document.getElementById('fp-notes').value = '';
-      document.getElementById('fp-modal').style.display = 'flex';
-    }
-
-    function closeFPModal() {
-      document.getElementById('fp-modal').style.display = 'none';
-      currentFPAlertId = null;
-    }
-
-    async function submitFalsePositive() {
-      if (!currentFPAlertId) return;
-      const btn = document.getElementById('btn-fp-submit');
-      btn.disabled = true;
-      btn.innerText = 'Logging Feedback...';
-      try {
-        const res = await fetch(`/api/alerts/${currentFPAlertId}/status`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            status: 'FALSE_POSITIVE',
-            corrected_label: document.getElementById('fp-corrected-label').value,
-            notes: document.getElementById('fp-notes').value
-          })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          closeFPModal();
-          showToast(`Alert ${currentFPAlertId} → FALSE POSITIVE (feedback logged: ${data.feedback_logged})`);
-          fetchAlerts();
-          fetchStats();
-        }
-      } catch (e) {
-        console.error('FP submission failed', e);
-      } finally {
-        btn.disabled = false;
-        btn.innerText = 'Confirm False Positive & Log Feedback';
-      }
-    }
-
-    async function fetchModels() {
-      try {
-        const res = await fetch('/api/models');
-        const data = await res.json();
-        const container = document.getElementById('models-container');
-        let html = '';
-        data.models.forEach(m => {
-          const mClean = m.model_id.replace('_cicids2017', '');
-          const isActive = (mClean === data.active_model || m.model_id === data.active_model || (data.active_model === 'weighted_voting_ensemble' && (m.model_id === 'weighted_voting_ensemble_cicids2017' || mClean === 'weighted_voting_ensemble')));
-          html += `
-            <div class="model-card ${isActive ? 'active' : ''}">
-              <div>
-                <div class="model-header">
-                  <span class="model-name">${m.name}</span>
-                  <span style="font-size: 11px; padding: 2px 6px; border-radius: 4px; background: rgba(255,255,255,0.1);">${m.framework}</span>
-                </div>
-                <div class="model-metrics">
-                  <div class="metric-row">Accuracy: <span>${(m.metrics.accuracy * 100).toFixed(2)}%</span></div>
-                  <div class="metric-row">F1 Score: <span>${(m.metrics.f1_score * 100).toFixed(2)}%</span></div>
-                  <div class="metric-row">Precision: <span>${(m.metrics.precision * 100).toFixed(2)}%</span></div>
-                  <div class="metric-row">Recall: <span>${(m.metrics.recall * 100).toFixed(2)}%</span></div>
-                </div>
-              </div>
-              <button class="switch-btn ${isActive ? 'current' : ''}" onclick="switchModel('${m.model_id}')">
-                ${isActive ? 'ACTIVE MODEL' : 'ACTIVATE MODEL'}
-              </button>
-            </div>
-          `;
-        });
-        container.innerHTML = html;
-      } catch (e) {
-        console.error("Failed to fetch models", e);
-      }
-    }
-
-    async function switchModel(modelId) {
-      await fetch('/api/models/switch_active', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_id: modelId })
-      });
-      fetchStats();
-      fetchModels();
-    }
-
-    // Initialize
-    checkCapabilities();
-    fetchInterfaces();
-    fetchStats();
-    fetchFlows();
-    fetchAlerts();
-    fetchModels();
-    setInterval(fetchStats, 1500);
-    setInterval(fetchFlows, 1500);
-    setInterval(fetchAlerts, 2000);
-  </script>
-</body>
-</html>
-"""

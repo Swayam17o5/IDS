@@ -23,6 +23,13 @@ venv.bak/
 # Logs
 *.log
 
+# Database temporary files
+*.db-shm
+*.db-wal
+
+# Scratch PCAPs
+scratch/*.pcap
+
 # OS generated files
 .DS_Store
 Thumbs.db

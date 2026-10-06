@@ -50,6 +50,7 @@ logger = logging.getLogger("aegis.dos_hulk_demo")
 # ── Paths ────────────────────────────────────────────────────────────────────
 SCRATCH_DIR = os.path.join(PROJECT_ROOT, "scratch")
 DEFAULT_PCAP_PATH = os.path.join(SCRATCH_DIR, "dos_hulk_demo.pcap")
+PHASE1_PCAP_PATH = os.path.join(SCRATCH_DIR, "dos_hulk_phase1.pcap")
 
 # ── Traffic parameters ───────────────────────────────────────────────────────
 ATTACKER_IP   = "10.0.0.50"   # RFC1918 attacker
@@ -243,6 +244,356 @@ def generate_dos_hulk_pcap(output_path: str = DEFAULT_PCAP_PATH) -> str:
     logger.info(
         "DoS Hulk PCAP generated: %s  (%d packets across %d flows, ~80s IAT spacing)",
         output_path, len(packets), NUM_FLOWS
+    )
+    return os.path.abspath(output_path)
+
+
+def generate_dos_hulk_pcap_phase2a(output_path: str = None, num_flows: int = 5) -> str:
+    """
+    Phase 2A implementation: Generate DoS Hulk PCAP with SYN/FIN flags removed ONLY.
+
+    CRITICAL CHANGES FROM PHASE 1:
+    - SYN flag (0x02) = 0 on ALL packets
+    - FIN flag (0x01) = 0 on ALL packets
+    - All other flags: UNCHANGED from Phase 1
+
+    Flag conversions:
+    - "S" (SYN) → "" (no flags, but still valid TCP packet)
+    - "SA" (SYN+ACK) → "A" (ACK only)
+    - "PA" (PSH+ACK) → "PA" (unchanged — keep PSH+ACK)
+    - "A" (ACK) → "A" (unchanged)
+    - "FA" (FIN+ACK) → "A" (ACK only, FIN removed)
+
+    UNCHANGED from Phase 1:
+    - Flow duration: 30–90 seconds (Phase 1 extended timing)
+    - Packet counts: 12 packets per flow
+    - Payload sizes and content: identical
+    - Window sizes: identical
+    - Source/destination IPs and ports: identical
+    - Protocol: TCP port 80
+    - Inter-packet timing: identical spread across flow duration
+
+    Parameters
+    ----------
+    output_path : str, optional
+        Destination .pcap file path. If None, defaults to scratch/dos_hulk_phase2a.pcap.
+    num_flows : int
+        Number of flows to generate (default 5 for Phase 2A test).
+
+    Returns
+    -------
+    str
+        Absolute path to the generated PCAP file.
+
+    Raises
+    ------
+    RuntimeError
+        If Scapy is not installed.
+    """
+    if output_path is None:
+        output_path = os.path.join(SCRATCH_DIR, "dos_hulk_phase2a.pcap")
+
+    try:
+        from scapy.all import Ether, IP, TCP, Raw, wrpcap
+    except ImportError:
+        raise RuntimeError(
+            "Scapy is required to generate the DoS Hulk PCAP. "
+            "Install it with: pip install scapy"
+        )
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # ── HTTP payload templates (same as Phase 1) ─────────────────────────────
+    _GET_TEMPLATES = [
+        "GET /?hulk={n:04d} HTTP/1.1\r\nHost: {victim}\r\nConnection: keep-alive\r\n\r\n",
+        "GET /index?id={n:04d} HTTP/1.1\r\nHost: {victim}\r\nAccept: */*\r\n\r\n",
+        "GET /page?q={n:04d} HTTP/1.1\r\nHost: {victim}\r\nKeep-Alive: 300\r\n\r\n",
+    ]
+    _RESP_BODY = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 1800\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        + ("X" * 1800)
+    )
+    _RESP_503 = (
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 56\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "<html><body><h1>503 Service Unavailable</h1></body></html>"
+    )
+
+    resp_bytes = _RESP_BODY.encode("utf-8")
+    err_bytes  = _RESP_503.encode("utf-8")
+
+    packets = []
+
+    # Base timestamp: flows spread across capture window, matching CICIDS2017
+    base_ts = time.time() - (num_flows * 100)
+
+    for flow_idx in range(num_flows):
+        sport = 49200 + flow_idx * 7
+        
+        # PHASE 1 CARRY-OVER: Flow duration sampled uniformly from 30–90 seconds
+        rng = random.Random(flow_idx)
+        flow_duration_seconds = rng.uniform(30.0, 90.0)
+        flow_start = base_ts + (flow_idx * 100.0)
+
+        get_template = _GET_TEMPLATES[flow_idx % len(_GET_TEMPLATES)]
+        get_payload  = get_template.format(n=flow_idx, victim=VICTIM_IP).encode("utf-8")
+
+        # Window sizes (identical to Phase 1)
+        atk_win    = 29200
+        victim_win = max(64, 235 - flow_idx * 10)
+
+        # ── Packet timestamps (identical to Phase 1) ──────────────────────
+        iat = flow_duration_seconds / (PKTS_PER_FLOW - 1)
+        iat = max(0.050, min(0.100, iat))
+        
+        t = [flow_start]
+        for _i in range(1, PKTS_PER_FLOW):
+            t.append(t[-1] + iat)
+
+        # Sequence numbers (identical)
+        isn_a = 500000 + flow_idx * 2000
+        isn_v = 700000 + flow_idx * 2000
+
+        def _pkt(src, dst, sp, dp, seq, ack, flags, win, payload=b"", ts=0.0):
+            p = (
+                Ether() /
+                IP(src=src, dst=dst, ttl=64) /
+                TCP(sport=sp, dport=dp, seq=seq, ack=ack,
+                    flags=flags, window=win) /
+                Raw(load=payload)
+            )
+            p.time = ts
+            return p
+
+        def _pkt_no_payload(src, dst, sp, dp, seq, ack, flags, win, ts=0.0):
+            p = (
+                Ether() /
+                IP(src=src, dst=dst, ttl=64) /
+                TCP(sport=sp, dport=dp, seq=seq, ack=ack,
+                    flags=flags, window=win)
+            )
+            p.time = ts
+            return p
+
+        # PHASE 2A CHANGE: Remove SYN/FIN flags from packet sequence
+        # Original packet 1: "S" → PHASE 2A: "" (no flags)
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        isn_a, 0, "", atk_win, ts=t[0]))
+        # Original packet 2: "SA" → PHASE 2A: "A" (ACK only, SYN removed)
+        packets.append(_pkt_no_payload(VICTIM_IP, ATTACKER_IP, VICTIM_PORT, sport,
+                                        isn_v, isn_a + 1, "A", victim_win, ts=t[1]))
+        # Original packet 3: "A" → PHASE 2A: "A" (unchanged)
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        isn_a + 1, isn_v + 1, "A", atk_win, ts=t[2]))
+
+        aseq = isn_a + 1
+        vseq = isn_v + 1
+        vack = isn_a + 1
+
+        # Requests 1–3: PSH+ACK GET → PSH+ACK resp → ACK
+        for req_n in range(3):
+            # Original: "PA" → PHASE 2A: "PA" (unchanged — PSH+ACK keep as is)
+            packets.append(_pkt(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                 aseq, vseq, "PA", atk_win,
+                                 payload=get_payload, ts=t[3 + req_n * 3]))
+            aseq += len(get_payload)
+
+            # Original: "PA" → PHASE 2A: "PA" (unchanged)
+            rpl = err_bytes if req_n == 2 else resp_bytes
+            rpl_win = max(0, victim_win - req_n * 80)
+            packets.append(_pkt(VICTIM_IP, ATTACKER_IP, VICTIM_PORT, sport,
+                                 vseq, aseq, "PA", rpl_win,
+                                 payload=rpl, ts=t[4 + req_n * 3]))
+            vseq += len(rpl)
+
+            # Original: "A" → PHASE 2A: "A" (unchanged)
+            if req_n < 2:
+                packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                                aseq, vseq, "A", atk_win, ts=t[5 + req_n * 3]))
+
+        # PHASE 2A CHANGE: FIN+ACK removed
+        # Original packet 12: "FA" → PHASE 2A: "A" (ACK only, FIN removed)
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        aseq, vseq, "A", atk_win, ts=t[11]))
+
+    # Sort by timestamp
+    packets.sort(key=lambda p: float(p.time))
+    wrpcap(output_path, packets)
+
+    logger.info(
+        "DoS Hulk Phase2A PCAP generated: %s (%d packets, SYN/FIN flags REMOVED, ~%.1fs duration per flow)",
+        output_path, len(packets), 60.0
+    )
+    return os.path.abspath(output_path)
+
+
+def generate_dos_hulk_pcap_phase1(output_path: str = PHASE1_PCAP_PATH, num_flows: int = NUM_FLOWS) -> str:
+    """
+    Phase 1 implementation: Generate DoS Hulk PCAP with extended flow duration (30–90 s).
+
+    Changes from original:
+    - Flow duration: uniformly sampled 30–90 seconds (matching genuine CICIDS2017 DoS Hulk)
+    - Inter-packet timing: 50–100 ms (sampled uniformly), stretched across the longer flow duration
+    - All other structural elements remain IDENTICAL to original generator
+
+    Packet sequence, TCP flags, payload sizes, window sizes, IP addresses all unchanged.
+    The only modification is flow timing.
+
+    Parameters
+    ----------
+    output_path : str
+        Destination .pcap file path. Defaults to scratch/dos_hulk_phase1.pcap.
+    num_flows : int
+        Number of flows to generate (default 15).
+
+    Returns
+    -------
+    str
+        Absolute path to the generated PCAP file.
+
+    Raises
+    ------
+    RuntimeError
+        If Scapy is not installed.
+    """
+    try:
+        from scapy.all import Ether, IP, TCP, Raw, wrpcap
+    except ImportError:
+        raise RuntimeError(
+            "Scapy is required to generate the DoS Hulk PCAP. "
+            "Install it with: pip install scapy"
+        )
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # ── HTTP payload templates (same as original) ─────────────────────────────
+    _GET_TEMPLATES = [
+        "GET /?hulk={n:04d} HTTP/1.1\r\nHost: {victim}\r\nConnection: keep-alive\r\n\r\n",
+        "GET /index?id={n:04d} HTTP/1.1\r\nHost: {victim}\r\nAccept: */*\r\n\r\n",
+        "GET /page?q={n:04d} HTTP/1.1\r\nHost: {victim}\r\nKeep-Alive: 300\r\n\r\n",
+    ]
+    _RESP_BODY = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 1800\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        + ("X" * 1800)
+    )
+    _RESP_503 = (
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 56\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "<html><body><h1>503 Service Unavailable</h1></body></html>"
+    )
+
+    resp_bytes = _RESP_BODY.encode("utf-8")
+    err_bytes  = _RESP_503.encode("utf-8")
+
+    packets = []
+
+    # Base timestamp: flows spread across capture window, matching CICIDS2017
+    base_ts = time.time() - (num_flows * 100)  # place in the recent past
+
+    for flow_idx in range(num_flows):
+        sport = 49200 + flow_idx * 7    # distinct ephemeral source port per flow
+        
+        # PHASE 1 CHANGE: Flow duration sampled uniformly from 30–90 seconds
+        rng = random.Random(flow_idx)
+        flow_duration_seconds = rng.uniform(30.0, 90.0)
+        flow_start = base_ts + (flow_idx * 100.0)
+
+        get_template = _GET_TEMPLATES[flow_idx % len(_GET_TEMPLATES)]
+        get_payload  = get_template.format(n=flow_idx, victim=VICTIM_IP).encode("utf-8")
+
+        # Window sizes (same as original)
+        atk_win    = 29200
+        victim_win = max(64, 235 - flow_idx * 10)
+
+        # ── Packet timestamps (PHASE 1 CHANGE) ──────────────────────────────
+        # Spread 12 packets uniformly across the flow_duration_seconds
+        # Compute inter-arrival time from flow duration
+        iat = flow_duration_seconds / (PKTS_PER_FLOW - 1)
+        # Clamp to 50–100 ms range (Phase 1 change: longer inter-packet timing)
+        iat = max(0.050, min(0.100, iat))
+        
+        t = [flow_start]
+        for _i in range(1, PKTS_PER_FLOW):
+            t.append(t[-1] + iat)
+
+        # Sequence numbers (same as original)
+        isn_a = 500000 + flow_idx * 2000
+        isn_v = 700000 + flow_idx * 2000
+
+        def _pkt(src, dst, sp, dp, seq, ack, flags, win, payload=b"", ts=0.0):
+            p = (
+                Ether() /
+                IP(src=src, dst=dst, ttl=64) /
+                TCP(sport=sp, dport=dp, seq=seq, ack=ack,
+                    flags=flags, window=win) /
+                Raw(load=payload)
+            )
+            p.time = ts
+            return p
+
+        def _pkt_no_payload(src, dst, sp, dp, seq, ack, flags, win, ts=0.0):
+            p = (
+                Ether() /
+                IP(src=src, dst=dst, ttl=64) /
+                TCP(sport=sp, dport=dp, seq=seq, ack=ack,
+                    flags=flags, window=win)
+            )
+            p.time = ts
+            return p
+
+        # Packet sequence (identical to original)
+        packets.append(_pkt(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                             isn_a, 0, "S", atk_win, ts=t[0]))
+        packets.append(_pkt(VICTIM_IP, ATTACKER_IP, VICTIM_PORT, sport,
+                             isn_v, isn_a + 1, "SA", victim_win, ts=t[1]))
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        isn_a + 1, isn_v + 1, "A", atk_win, ts=t[2]))
+
+        aseq = isn_a + 1
+        vseq = isn_v + 1
+        vack = isn_a + 1
+
+        for req_n in range(3):
+            packets.append(_pkt(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                 aseq, vseq, "PA", atk_win,
+                                 payload=get_payload, ts=t[3 + req_n * 3]))
+            aseq += len(get_payload)
+
+            rpl = err_bytes if req_n == 2 else resp_bytes
+            rpl_win = max(0, victim_win - req_n * 80)
+            packets.append(_pkt(VICTIM_IP, ATTACKER_IP, VICTIM_PORT, sport,
+                                 vseq, aseq, "PA", rpl_win,
+                                 payload=rpl, ts=t[4 + req_n * 3]))
+            vseq += len(rpl)
+
+            if req_n < 2:
+                packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                                aseq, vseq, "A", atk_win, ts=t[5 + req_n * 3]))
+
+        packets.append(_pkt(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                             aseq, vseq, "FA", atk_win, ts=t[11]))
+
+    # Sort by timestamp
+    packets.sort(key=lambda p: float(p.time))
+    wrpcap(output_path, packets)
+
+    logger.info(
+        "DoS Hulk Phase1 PCAP generated: %s (%d packets, ~%.1fs duration per flow)",
+        output_path, len(packets), 60.0  # approximate average of 30-90s range
     )
     return os.path.abspath(output_path)
 

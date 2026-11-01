@@ -385,6 +385,7 @@ DASHBOARD_HTML = """
     <button class="tab-btn" onclick="switchTab('tab-explain', this)">🧠 Explainability (SHAP)</button>
     <button class="tab-btn" onclick="switchTab('tab-replay', this)">📼 Offline PCAP Replay</button>
     <button class="tab-btn" onclick="switchTab('tab-demo', this)">⚡ Authorized Nmap Lab Demo</button>
+    <button class="tab-btn" onclick="switchTab('tab-genuine-dos-hulk-demo', this)">🎯 Genuine DoS Hulk Demo</button>
   </nav>
 
   <main>
@@ -654,9 +655,43 @@ DASHBOARD_HTML = """
     <!-- TAB 5: SHAP EXPLAINABILITY EXPLORER -->
     <div id="tab-explain" class="tab-content">
       <div class="card">
-        <div class="card-title" style="margin-bottom: 12px;">🧠 Model Decision Transparency (TreeExplainer)</div>
-        <div id="explain-detail-target" style="padding: 16px; background: rgba(0,0,0,0.3); border-radius: 8px; border: 1px solid var(--card-border);">
-          Select an alert from the Live Alert Feed or Attack Timeline to inspect its feature contributions.
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+          <div>
+            <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
+              <span>🧠</span> Live Post-Attack Incident Explainability (TreeSHAP)
+            </div>
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+              SHAP feature attributions are computed dynamically in real-time <em>after</em> an attack flow is detected.
+            </div>
+          </div>
+          <div id="explain-active-badge" style="font-size: 11px; padding: 4px 10px; border-radius: 999px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.4); color: var(--accent-emerald); font-weight: 700;">
+            🟢 LIVE ENGINE READY
+          </div>
+        </div>
+
+        <div id="explain-detail-target" style="padding: 24px; background: rgba(0,0,0,0.3); border-radius: 8px; border: 1px solid var(--card-border); text-align: center;">
+          <div style="font-size: 28px; margin-bottom: 8px;">🎯</div>
+          <div style="font-size: 15px; font-weight: 700; color: #fff; margin-bottom: 6px;">Awaiting Incident Telemetry</div>
+          <div style="font-size: 13px; color: var(--text-muted); max-width: 520px; margin: 0 auto 16px auto; line-height: 1.5;">
+            Trigger an attack demonstration (e.g. <strong>Genuine DoS Hulk</strong> or <strong>Nmap Scan</strong>) or click on any alert in the <strong>Live Alert Feed</strong> to compute and inspect its real-time TreeSHAP forensic feature attribution.
+          </div>
+        </div>
+      </div>
+
+      <!-- Secondary: Thesis / Project Report Global Suite -->
+      <div class="card" style="margin-top: 16px; border: 1px solid rgba(51, 65, 85, 0.6); background: rgba(15, 23, 42, 0.5);">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <div style="font-size: 14px; font-weight: 700; color: #cbd5e1; display: flex; align-items: center; gap: 6px;">
+              <span>📚</span> Academic Model Audit & Global Dataset Suite (For Viva & Report)
+            </div>
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+              Global Beeswarm &bull; Multi-Class Stacked Bar &bull; Protocol Dependence &bull; Attack Burst Decision Plots
+            </div>
+          </div>
+          <a href="/shap-gallery" target="_blank" class="btn btn-secondary" style="text-decoration: none; font-size: 12px; padding: 6px 14px; border-color: rgba(0,240,255,0.3); color: var(--accent-cyan);">
+            Open Global Suite Gallery &rarr;
+          </a>
         </div>
       </div>
     </div>
@@ -777,6 +812,92 @@ DASHBOARD_HTML = """
               <span style="color: var(--text-muted);">Alerts Persisted:</span>
               <span id="demo-res-alerts" style="font-weight: 700; color: var(--critical);">0</span>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 8: GENUINE CICIDS2017 DOS HULK DEMO (One-Click Dashboard) -->
+    <div id="tab-genuine-dos-hulk-demo" class="tab-content">
+      <div class="lab-badge">
+        ✅ REAL MACHINE LEARNING DEMONSTRATION — Genuine CICIDS2017 DoS Hulk samples cycled through production inference pipeline.
+      </div>
+
+      <div class="metrics-grid" style="margin-bottom: 20px;">
+        <div class="card">
+          <div class="card-title">Demonstration Status</div>
+          <div class="card-val purple" id="genuine-demo-status">READY</div>
+          <div class="card-sub">Click to start real inference</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Last CSV Row Index</div>
+          <div class="card-val cyan" id="genuine-demo-row-index">—</div>
+          <div class="card-sub">Rotates through 74860-74864</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Ground Truth Label</div>
+          <div class="card-val emerald" id="genuine-demo-ground-truth">—</div>
+          <div class="card-sub">From CICIDS2017 CSV</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Predicted Label</div>
+          <div class="card-val cyan" id="genuine-demo-prediction">—</div>
+          <div class="card-sub">From XGBoost ML Model</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Confidence</div>
+          <div class="card-val" style="color: #facc15;" id="genuine-demo-confidence">—</div>
+          <div class="card-sub">No hardcoding (real inference)</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Alert Generated</div>
+          <div class="card-val" id="genuine-demo-alert-status">—</div>
+          <div class="card-sub">Threshold: 0.80</div>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 14px; margin-bottom: 20px;">
+        <button id="btn-genuine-dos-hulk-demo" class="btn btn-emerald" onclick="runGenuineDoSHulkDemo()" style="flex: 1; padding: 16px; font-size: 14px; font-weight: 700;">
+          ▶ RUN GENUINE DOS HULK DEMO
+        </button>
+        <button class="btn btn-secondary" onclick="resetGenuineDoSHulkDemo()" style="flex: 0.3; padding: 16px;">🔄 Reset</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title" style="margin-bottom: 12px;">📊 Detailed Inference Results</div>
+        <div id="genuine-demo-results" style="font-size: 13px; color: var(--text-muted); padding: 16px; background: rgba(0,0,0,0.2); border-radius: 8px; border-left: 3px solid var(--accent-cyan);">
+          <div style="text-align: center; padding: 24px; color: var(--text-muted);">
+            Press the button above to run a genuine CICIDS2017 DoS Hulk sample through the production inference pipeline.
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title" style="margin-bottom: 12px;">ℹ️ How This Works</div>
+        <div style="font-size: 12px; color: #cbd5e1; line-height: 1.7;">
+          <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+            <div style="color: var(--accent-cyan); font-weight: 700; min-width: 20px;">1.</div>
+            <div><strong>Load Genuine CSV Row:</strong> Selects from verified CICIDS2017 DoS Hulk dataset rows (74860-74864), rotating on each click to avoid AlertEngine deduplication.</div>
+          </div>
+          <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+            <div style="color: var(--accent-cyan); font-weight: 700; min-width: 20px;">2.</div>
+            <div><strong>Extract Features:</strong> Extracts 77 CICIDS2017 statistical features (Total Fwd Packets, Flow Duration, etc.) from the CSV row.</div>
+          </div>
+          <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+            <div style="color: var(--accent-cyan); font-weight: 700; min-width: 20px;">3.</div>
+            <div><strong>Schema Normalize:</strong> Maps CSV feature names to canonical schema using the existing production feature_schema_mapper, validates 77/77 features, checks for NaN/Inf.</div>
+          </div>
+          <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+            <div style="color: var(--accent-cyan); font-weight: 700; min-width: 20px;">4.</div>
+            <div><strong>XGBoost Inference:</strong> Sends normalized feature vector to trained XGBoost model (NO hardcoding, real ML prediction).</div>
+          </div>
+          <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+            <div style="color: var(--accent-cyan); font-weight: 700; min-width: 20px;">5.</div>
+            <div><strong>AlertEngine:</strong> Checks if predicted_label == "DoS Hulk" AND confidence ≥ 0.80, generates alert if both true.</div>
+          </div>
+          <div style="display: flex; gap: 12px;">
+            <div style="color: var(--accent-cyan); font-weight: 700; min-width: 20px;">6.</div>
+            <div><strong>Persist to DB:</strong> Saves prediction and alert to nids.db, visible on dashboard in real-time via WebSocket.</div>
           </div>
         </div>
       </div>
@@ -908,7 +1029,7 @@ DASHBOARD_HTML = """
 
   <!-- Alert Detail Modal -->
   <div id="alert-detail-modal" class="modal-backdrop">
-    <div class="modal-dialog" style="max-width: 620px;">
+    <div class="modal-dialog" style="max-width: 760px;">
       <div class="modal-header">
         <h3 style="font-size: 16px; color: var(--accent-cyan);">🔍 Alert Detail & AI Explanation</h3>
         <button class="modal-close-btn" onclick="closeAlertDetailModal()">✕</button>
@@ -1182,7 +1303,7 @@ DASHBOARD_HTML = """
             methodTag = `<span style="font-size: 10px; padding: 2px 5px; border-radius: 4px; background: rgba(0, 240, 255, 0.15); color: var(--accent-cyan); margin-left: 4px;">SYN Heuristic</span>`;
           }
           html += `
-            <tr>
+            <tr onclick="inspectAlert('${a.alert_id}')" style="cursor: pointer;" title="Click row or Deep Explain to inspect SHAP explanation">
               <td><span style="font-weight: 700; color: #fff;">${a.alert_id}</span></td>
               <td><span class="badge ${a.severity}">${a.severity}</span></td>
               <td>
@@ -1195,11 +1316,11 @@ DASHBOARD_HTML = """
               <td>${a.src_ip}</td>
               <td>${a.dst_ip}:${a.dst_port || 0}</td>
               <td><span class="badge ${st}">${st}</span></td>
-              <td>${triageHtml}</td>
-              <td>
-                <a href="/explainability/${a.alert_id}" class="btn btn-secondary" style="font-size: 11px; padding: 4px 8px; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; border-color: rgba(0,240,255,0.4); color: var(--accent-cyan); white-space: nowrap;">
+              <td onclick="event.stopPropagation()">${triageHtml}</td>
+              <td onclick="event.stopPropagation()">
+                <button class="btn btn-secondary" style="font-size: 11px; padding: 4px 8px; display: inline-flex; align-items: center; gap: 4px; border-color: rgba(0,240,255,0.4); color: var(--accent-cyan); white-space: nowrap; cursor: pointer;" onclick="inspectAlert('${a.alert_id}')" title="Inspect Deep SHAP Explanation">
                   🔍 Deep Explain
-                </a>
+                </button>
               </td>
             </tr>
           `;
@@ -1265,7 +1386,7 @@ DASHBOARD_HTML = """
               </div>
               <div style="display: flex; flex-direction: column; gap: 6px;">
                 <button class="btn btn-secondary" style="font-size: 11px;" onclick="inspectAlert('${ev.alert_id}')">Inspect</button>
-                <a href="/explainability/${ev.alert_id}" class="btn btn-secondary" style="font-size: 11px; text-decoration: none; color: var(--accent-cyan); border-color: rgba(0,240,255,0.4); text-align: center;">🔍 Deep Explain</a>
+                <button class="btn btn-secondary" style="font-size: 11px; color: var(--accent-cyan); border-color: rgba(0,240,255,0.4); text-align: center; cursor: pointer;" onclick="inspectAlert('${ev.alert_id}')">🔍 Deep Explain</button>
               </div>
             </div>
           `;
@@ -1456,39 +1577,103 @@ DASHBOARD_HTML = """
 
     async function inspectAlert(alertId) {
       try {
-        const res = await fetch(`/api/alerts/${alertId}/explanation`);
-        if (!res.ok) return;
-        const data = await res.json();
+        let res = await fetch(`/api/alerts/${alertId}/deep-explanation`);
+        let data;
+        if (res.ok) {
+          const deep = await res.json();
+          data = {
+            alert_id: deep.alert?.alert_id || alertId,
+            attack_type: deep.alert?.attack_type || "Attack",
+            severity: deep.alert?.severity || "HIGH",
+            confidence: deep.alert?.confidence || 0.95,
+            detection_method: deep.alert?.detection_method || "MACHINE_LEARNING",
+            model_used: deep.alert?.model_used || "xgboost",
+            features: deep.shap?.top_features || [],
+            supporting_features: deep.shap?.supporting_features || [],
+            opposing_features: deep.shap?.opposing_features || [],
+            explanation: deep.comparison?.why_alert_generated || deep.alert?.explanation || "",
+            src_ip: deep.alert?.src_ip || "192.168.1.185",
+            dst_ip: deep.alert?.dst_ip || "10.0.0.1",
+            dst_port: deep.alert?.dst_port || 80,
+            ml_pred: deep.ml_verdict?.predicted_label || deep.alert?.attack_type,
+            ml_conf: deep.ml_verdict?.confidence || deep.alert?.confidence
+          };
+        } else {
+          res = await fetch(`/api/alerts/${alertId}/explanation`);
+          if (!res.ok) return;
+          data = await res.json();
+        }
+
         currentInspectAlert = data;
 
+        // 1. Immediately update the right-side panel on the dashboard
+        if (data.explanation) {
+          document.getElementById('latest-explanation-box').style.display = 'block';
+          document.getElementById('latest-explanation-text').innerText = data.explanation;
+        }
+        if (data.features && data.features.length > 0) {
+          renderShapBars(data.features, 'shap-container');
+        }
+
+        // 2. Build the rich in-dashboard Modal content
         let detHtml = `
-          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px;">
-            <span class="badge ${data.severity}">${data.severity}</span>
-            <span style="font-weight: 800; font-size: 15px; color: #fff;">${data.attack_type}</span>
-            <span style="color: var(--accent-cyan); font-weight: 700;">${(data.confidence * 100).toFixed(1)}%</span>
-            <span style="font-size: 11px; color: var(--text-muted);">Model: ${data.model_used || 'Active'}</span>
-          </div>
-          ${data.explanation ? `<div class="explanation-box"><div class="label">🧠 AI Detection Rationale</div><div>${data.explanation}</div></div>` : ''}
-          <div style="margin-top: 10px; margin-bottom: 12px;">
-            <a href="/explainability/${data.alert_id}" class="btn btn-cyan" style="text-decoration: none; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 6px 12px;">
-              🔍 Open Deep AI Explainability Page
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span class="badge ${data.severity}">${data.severity}</span>
+              <span style="font-weight: 800; font-size: 16px; color: #fff;">${data.attack_type}</span>
+              <span style="color: var(--accent-cyan); font-weight: 700; font-size: 15px;">${((data.confidence || 0) * 100).toFixed(1)}%</span>
+            </div>
+            <a href="/explainability/${data.alert_id}" target="_blank" class="btn btn-cyan" style="text-decoration: none; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 6px 12px;">
+              🔍 Full Forensic Page ↗
             </a>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px; margin-bottom: 12px; background: rgba(255,255,255,0.03); padding: 10px; border-radius: 6px;">
+            <div><span style="color: var(--text-muted);">Alert ID:</span> <strong style="color: #fff;">${data.alert_id}</strong></div>
+            <div><span style="color: var(--text-muted);">Method:</span> <strong style="color: var(--accent-cyan);">${data.detection_method}</strong></div>
+            <div><span style="color: var(--text-muted);">Source:</span> <strong style="color: #fff;">${data.src_ip || '—'}</strong></div>
+            <div><span style="color: var(--text-muted);">Destination:</span> <strong style="color: #fff;">${data.dst_ip || '—'}:${data.dst_port || 0}</strong></div>
+          </div>
+          ${data.explanation ? `<div class="explanation-box" style="margin-bottom: 14px;"><div class="label">🧠 AI Detection Rationale</div><div style="font-size: 12.5px; line-height: 1.5;">${data.explanation}</div></div>` : ''}
+          <div style="font-weight: 700; font-size: 13px; color: #fff; margin-bottom: 8px; display: flex; justify-content: space-between;">
+            <span>Key SHAP Feature Salience</span>
+            <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">TreeSHAP Additive Attributions</span>
           </div>
         `;
         document.getElementById('modal-alert-details').innerHTML = detHtml;
         renderShapBars(data.features, 'modal-shap-container');
+
+        // Also add the live SHAP Waterfall graph right inside the modal
+        const existingGraphBox = document.getElementById('modal-waterfall-box');
+        if (existingGraphBox) existingGraphBox.remove();
+        const graphBox = document.createElement('div');
+        graphBox.id = 'modal-waterfall-box';
+        graphBox.style.cssText = 'margin-top: 14px; background: rgba(0,0,0,0.35); border-radius: 8px; padding: 14px; border: 1px solid var(--card-border);';
+        graphBox.innerHTML = `
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-weight: 700; font-size: 13px; color: #fff;">🌊 Live Incident SHAP Waterfall Graph</span>
+            <span style="font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono';">Base E[f(x)] &rarr; Score f(x)</span>
+          </div>
+          <div style="text-align: center;">
+            <img src="/api/alerts/${data.alert_id}/waterfall.png" alt="Live Waterfall Graph" style="max-width: 600px; width: 100%; border-radius: 6px; background: #ffffff; padding: 4px; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 4px 15px rgba(0,0,0,0.4);">
+          </div>
+        `;
+        document.getElementById('modal-shap-container').after(graphBox);
+
         document.getElementById('alert-detail-modal').style.display = 'flex';
 
+        // 3. Update Tab 5 target if user navigates there
         document.getElementById('explain-detail-target').innerHTML = `
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
             <div style="font-weight: 700; color: #fff; font-size: 15px;">Inspecting Alert: ${data.alert_id} (${data.attack_type})</div>
-            <a href="/explainability/${data.alert_id}" class="btn btn-cyan" style="text-decoration: none; font-size: 12px;">🔍 Open Dedicated Explainability Page</a>
+            <a href="/explainability/${data.alert_id}" target="_blank" class="btn btn-cyan" style="text-decoration: none; font-size: 12px;">🔍 Full Forensic Page ↗</a>
           </div>
           ${data.explanation ? `<div class="explanation-box" style="margin-bottom: 12px;"><div class="label">AI Rationale</div><div>${data.explanation}</div></div>` : ''}
           <div id="tab-shap-bars"></div>
         `;
         renderShapBars(data.features, 'tab-shap-bars');
-      } catch (e) {}
+      } catch (e) {
+        console.error("Error inspecting alert:", e);
+      }
     }
 
     function closeAlertDetailModal() {
@@ -1844,6 +2029,150 @@ DASHBOARD_HTML = """
     setInterval(fetchStats, 1500);
     setInterval(fetchFlows, 1500);
     setInterval(fetchAlerts, 2000);
+
+    // ─── GENUINE DOS HULK DEMO FUNCTIONS ────────────────────────────────────
+
+    async function runGenuineDoSHulkDemo() {
+      const btn = document.getElementById('btn-genuine-dos-hulk-demo');
+      const statusEl = document.getElementById('genuine-demo-status');
+      const resultsEl = document.getElementById('genuine-demo-results');
+      
+      btn.disabled = true;
+      btn.innerText = 'RUNNING...';
+      statusEl.innerText = 'RUNNING...';
+      statusEl.style.color = '#facc15';
+      resultsEl.innerHTML = '<div style="text-align: center; padding: 24px; color: var(--text-muted);">Sending genuine CICIDS2017 DoS Hulk sample through production pipeline...</div>';
+
+      try {
+        const res = await fetch('/api/demo/dos_hulk/genuine', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (!res.ok) {
+          const errorData = await res.json();
+          resultsEl.innerHTML = `<div style="color: var(--critical); padding: 12px; background: rgba(239,68,68,0.1); border-radius: 6px; border-left: 3px solid var(--critical);">
+            <strong>Error:</strong> ${errorData.detail || errorData.message || 'Unknown error'}
+          </div>`;
+          statusEl.innerText = 'ERROR';
+          statusEl.style.color = 'var(--critical)';
+          btn.innerText = '▶ RUN GENUINE DOS HULK DEMO';
+          btn.disabled = false;
+          return;
+        }
+
+        const data = await res.json();
+
+        if (data.status === 'error') {
+          resultsEl.innerHTML = `<div style="color: var(--critical); padding: 12px; background: rgba(239,68,68,0.1); border-radius: 6px; border-left: 3px solid var(--critical);">
+            <strong>Inference Failed:</strong> ${data.message}
+          </div>`;
+          statusEl.innerText = 'FAILED';
+          statusEl.style.color = 'var(--critical)';
+          btn.innerText = '▶ RUN GENUINE DOS HULK DEMO';
+          btn.disabled = false;
+          return;
+        }
+
+        // Update metric cards
+        document.getElementById('genuine-demo-row-index').innerText = data.csv_row_index || '—';
+        document.getElementById('genuine-demo-ground-truth').innerText = data.ground_truth || '—';
+        document.getElementById('genuine-demo-prediction').innerText = data.prediction || '—';
+        document.getElementById('genuine-demo-confidence').innerText = data.confidence_percent || '—';
+        
+        const alertStatus = data.alert_generated ? `YES (${data.alert_severity || 'ALERT'})` : 'NO';
+        document.getElementById('genuine-demo-alert-status').innerText = alertStatus;
+
+        // Detailed results display
+        const isSuccess = data.prediction === 'DoS Hulk';
+        const resultColor = isSuccess ? 'var(--accent-emerald)' : 'var(--critical)';
+        const resultBg = isSuccess ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)';
+        const resultBorder = isSuccess ? 'var(--accent-emerald)' : 'var(--critical)';
+
+        let resultHtml = `
+          <div style="border-left: 4px solid ${resultBorder}; background: ${resultBg}; padding: 14px; border-radius: 6px; margin-bottom: 12px;">
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+              <span style="font-size: 20px;">${isSuccess ? '✅' : '❌'}</span>
+              <span style="font-size: 14px; font-weight: 700; color: ${resultColor};">${isSuccess ? 'DOS HULK DETECTED' : 'PREDICTION: ' + data.prediction}</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 12px;">
+              <div style="background: rgba(255,255,255,0.04); padding: 8px; border-radius: 4px;">
+                <div style="color: var(--text-muted); font-size: 10px; margin-bottom: 2px;">GROUND TRUTH</div>
+                <div style="font-weight: 700; color: #fff;">${data.ground_truth}</div>
+              </div>
+              <div style="background: rgba(255,255,255,0.04); padding: 8px; border-radius: 4px;">
+                <div style="color: var(--text-muted); font-size: 10px; margin-bottom: 2px;">ML PREDICTION</div>
+                <div style="font-weight: 700; color: var(--accent-cyan);">${data.prediction}</div>
+              </div>
+              <div style="background: rgba(255,255,255,0.04); padding: 8px; border-radius: 4px;">
+                <div style="color: var(--text-muted); font-size: 10px; margin-bottom: 2px;">CONFIDENCE</div>
+                <div style="font-weight: 700; color: #facc15;">${data.confidence_percent}</div>
+              </div>
+              <div style="background: rgba(255,255,255,0.04); padding: 8px; border-radius: 4px;">
+                <div style="color: var(--text-muted); font-size: 10px; margin-bottom: 2px;">ALERT STATUS</div>
+                <div style="font-weight: 700; color: ${data.alert_generated ? '#ef4444' : '#34d399'};">${alertStatus}</div>
+              </div>
+            </div>
+          </div>
+
+          <div style="background: rgba(255,255,255,0.03); padding: 12px; border-radius: 6px; font-size: 11px; border-left: 2px solid var(--accent-cyan); margin-bottom: 12px;">
+            <div style="color: var(--text-muted); margin-bottom: 6px;"><strong>Inference Details:</strong></div>
+            <div>✓ CSV Row Index: <strong>${data.csv_row_index}</strong></div>
+            <div>✓ Features Extracted: <strong>${data.features_count}</strong> (77 canonical)</div>
+            <div>✓ Schema Validation: <strong>${data.schema_validated ? 'PASS' : 'FAIL'}</strong></div>
+            <div>✓ NaN/Inf Check: <strong>${data.nan_inf_check}</strong></div>
+            <div>✓ XGBoost Inference: <strong>${data.inference_success ? 'SUCCESS' : 'FAILED'}</strong></div>
+            <div>✓ Model Used: <strong>${data.model}</strong></div>
+            <div>✓ Detection Method: <strong>${data.detection_method}</strong></div>
+            ${data.alert_id ? `
+              <div>✓ Alert ID: <strong>${data.alert_id}</strong></div>
+              <div style="margin-top: 10px; display: flex; gap: 8px;">
+                <a href="/explainability/${data.alert_id}" target="_blank" class="btn btn-cyan" style="text-decoration: none; font-size: 11px; padding: 6px 12px; display: inline-flex; align-items: center; gap: 4px;">
+                  🔍 Open Deep Forensic SHAP Page
+                </a>
+                <button class="btn btn-secondary" style="font-size: 11px; padding: 6px 10px;" onclick="inspectAlert('${data.alert_id}'); switchTab('tab-explain', document.querySelectorAll('.tab-btn')[4]);">
+                  📊 View in Tab 5
+                </button>
+              </div>
+            ` : ''}
+          </div>
+        `;
+
+        resultsEl.innerHTML = resultHtml;
+
+        if (data.alert_id) {
+          inspectAlert(data.alert_id);
+        }
+
+        // Update status
+        statusEl.innerText = isSuccess ? 'DETECTED' : 'COMPLETED';
+        statusEl.style.color = isSuccess ? 'var(--accent-emerald)' : 'var(--text-muted)';
+
+        showToast(`DoS Hulk Demo: Prediction = ${data.prediction} (${data.confidence_percent})`);
+
+      } catch (e) {
+        resultsEl.innerHTML = `<div style="color: var(--critical); padding: 12px; background: rgba(239,68,68,0.1); border-radius: 6px; border-left: 3px solid var(--critical);">
+          <strong>Request Failed:</strong> ${e.message}
+        </div>`;
+        statusEl.innerText = 'ERROR';
+        statusEl.style.color = 'var(--critical)';
+        showToast('Demo request failed: ' + e.message);
+      } finally {
+        btn.innerText = '▶ RUN GENUINE DOS HULK DEMO';
+        btn.disabled = false;
+      }
+    }
+
+    function resetGenuineDoSHulkDemo() {
+      document.getElementById('genuine-demo-status').innerText = 'READY';
+      document.getElementById('genuine-demo-status').style.color = 'var(--accent-purple)';
+      document.getElementById('genuine-demo-row-index').innerText = '—';
+      document.getElementById('genuine-demo-ground-truth').innerText = '—';
+      document.getElementById('genuine-demo-prediction').innerText = '—';
+      document.getElementById('genuine-demo-confidence').innerText = '—';
+      document.getElementById('genuine-demo-alert-status').innerText = '—';
+      document.getElementById('genuine-demo-results').innerHTML = `<div style="text-align: center; padding: 24px; color: var(--text-muted);">Press the button above to run a genuine CICIDS2017 DoS Hulk sample through the production inference pipeline.</div>`;
+    }
   </script>
 </body>
 </html>

@@ -885,5 +885,182 @@ class DosHulkDemoRunner:
             }
 
 
+def generate_dos_hulk_pcap_phase3a(output_path: str = None, num_flows: int = 5) -> str:
+    """
+    Phase 3A (CORRECTED) implementation: Generate DoS Hulk PCAP with modified packet-size distribution.
+
+    CRITICAL CHANGES FROM PHASE 1/2A:
+    - Forward payload sizes INCREASED: ~54 bytes → ~300 bytes (add padding to GET requests)
+    - Backward response sizes INCREASED: ~1944 bytes → ~2500+ bytes (larger responses to match DoS Hulk)
+    - Goal: Increase average packet size from ~400 to ~800+ bytes (match DoS Hulk pattern)
+
+    UNCHANGED from Phase 1/2A:
+    - Flow duration: 30–90 seconds
+    - Packet count: 12 packets per flow
+    - Flags: SYN/FIN removed (Phase 2A state)
+    - Window sizes: identical
+    - Source/destination IPs and ports: identical
+    - Protocol: TCP port 80
+    - Inter-packet timing: identical spread
+
+    Parameters
+    ----------
+    output_path : str, optional
+        Destination .pcap file path. If None, defaults to scratch/dos_hulk_phase3a.pcap.
+    num_flows : int
+        Number of flows to generate (default 5 for Phase 3A test).
+
+    Returns
+    -------
+    str
+        Absolute path to the generated PCAP file.
+    """
+    if output_path is None:
+        output_path = os.path.join(SCRATCH_DIR, "dos_hulk_phase3a.pcap")
+
+    try:
+        from scapy.all import Ether, IP, TCP, Raw, wrpcap
+    except ImportError:
+        raise RuntimeError(
+            "Scapy is required to generate the DoS Hulk PCAP. "
+            "Install it with: pip install scapy"
+        )
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # ── PHASE 3A CHANGE (CORRECTED): Modified payload templates ──────────────
+    # Forward: Increase GET request size with padding (target: ~300-350 bytes)
+    _GET_PADDING = "A" * 250  # Add padding to reach ~300+ bytes total
+    _GET_TEMPLATES = [
+        "GET /?hulk={n:04d}&data=" + _GET_PADDING + " HTTP/1.1\r\nHost: {victim}\r\nConnection: keep-alive\r\n\r\n",
+        "GET /index?id={n:04d}&pad=" + _GET_PADDING + " HTTP/1.1\r\nHost: {victim}\r\nAccept: */*\r\n\r\n",
+        "GET /page?q={n:04d}&load=" + _GET_PADDING + " HTTP/1.1\r\nHost: {victim}\r\nKeep-Alive: 300\r\n\r\n",
+    ]
+    
+    # Backward: INCREASE response size (target: ~3600+ bytes, much larger than Phase 1's 1944)
+    # This matches DoS Hulk backward payload distribution better
+    _RESP_BODY = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 3600\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+        + ("X" * 3600)  # PHASE 3A (CORRECTED): Increased from 1800 to 3600 bytes (doubled)
+    )
+    _RESP_503 = (
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 56\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "<html><body><h1>503 Service Unavailable</h1></body></html>"
+    )
+
+    resp_bytes = _RESP_BODY.encode("utf-8")
+    err_bytes  = _RESP_503.encode("utf-8")
+
+    packets = []
+
+    # Base timestamp
+    base_ts = time.time() - (num_flows * 100)
+
+    for flow_idx in range(num_flows):
+        sport = 49200 + flow_idx * 7
+        
+        # PHASE 1 CARRY-OVER: Flow duration 30–90 seconds
+        rng = random.Random(flow_idx)
+        flow_duration_seconds = rng.uniform(30.0, 90.0)
+        flow_start = base_ts + (flow_idx * 100.0)
+
+        get_template = _GET_TEMPLATES[flow_idx % len(_GET_TEMPLATES)]
+        get_payload  = get_template.format(n=flow_idx, victim=VICTIM_IP).encode("utf-8")
+
+        # Window sizes (unchanged)
+        atk_win    = 29200
+        victim_win = max(64, 235 - flow_idx * 10)
+
+        # Packet timestamps (unchanged)
+        iat = flow_duration_seconds / (PKTS_PER_FLOW - 1)
+        iat = max(0.050, min(0.100, iat))
+        
+        t = [flow_start]
+        for _i in range(1, PKTS_PER_FLOW):
+            t.append(t[-1] + iat)
+
+        # Sequence numbers (unchanged)
+        isn_a = 500000 + flow_idx * 2000
+        isn_v = 700000 + flow_idx * 2000
+
+        def _pkt(src, dst, sp, dp, seq, ack, flags, win, payload=b"", ts=0.0):
+            p = (
+                Ether() /
+                IP(src=src, dst=dst, ttl=64) /
+                TCP(sport=sp, dport=dp, seq=seq, ack=ack,
+                    flags=flags, window=win) /
+                Raw(load=payload)
+            )
+            p.time = ts
+            return p
+
+        def _pkt_no_payload(src, dst, sp, dp, seq, ack, flags, win, ts=0.0):
+            p = (
+                Ether() /
+                IP(src=src, dst=dst, ttl=64) /
+                TCP(sport=sp, dport=dp, seq=seq, ack=ack,
+                    flags=flags, window=win)
+            )
+            p.time = ts
+            return p
+
+        # PHASE 2A state: SYN/FIN removed (no flags)
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        isn_a, 0, "", atk_win, ts=t[0]))
+        # "A" (SYN removed)
+        packets.append(_pkt_no_payload(VICTIM_IP, ATTACKER_IP, VICTIM_PORT, sport,
+                                        isn_v, isn_a + 1, "A", victim_win, ts=t[1]))
+        # "A"
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        isn_a + 1, isn_v + 1, "A", atk_win, ts=t[2]))
+
+        aseq = isn_a + 1
+        vseq = isn_v + 1
+        vack = isn_a + 1
+
+        # Requests 1–3: PSH+ACK GET (now larger due to padding) → PSH+ACK resp (now smaller) → ACK
+        for req_n in range(3):
+            # PHASE 3A: Larger GET payload due to padding
+            packets.append(_pkt(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                 aseq, vseq, "PA", atk_win,
+                                 payload=get_payload, ts=t[3 + req_n * 3]))
+            aseq += len(get_payload)
+
+            # PHASE 3A: Smaller response (850 vs 1944)
+            rpl = err_bytes if req_n == 2 else resp_bytes
+            rpl_win = max(0, victim_win - req_n * 80)
+            packets.append(_pkt(VICTIM_IP, ATTACKER_IP, VICTIM_PORT, sport,
+                                 vseq, aseq, "PA", rpl_win,
+                                 payload=rpl, ts=t[4 + req_n * 3]))
+            vseq += len(rpl)
+
+            # "A"
+            if req_n < 2:
+                packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                                aseq, vseq, "A", atk_win, ts=t[5 + req_n * 3]))
+
+        # PHASE 2A state: FIN removed
+        packets.append(_pkt_no_payload(ATTACKER_IP, VICTIM_IP, sport, VICTIM_PORT,
+                                        aseq, vseq, "A", atk_win, ts=t[11]))
+
+    # Sort by timestamp
+    packets.sort(key=lambda p: float(p.time))
+    wrpcap(output_path, packets)
+
+    logger.info(
+        "DoS Hulk Phase3A PCAP generated: %s (%d packets, packet-size distribution modified, ~%.1fs duration per flow)",
+        output_path, len(packets), 60.0
+    )
+    return os.path.abspath(output_path)
+
+
 # Module-level singleton (mirrors NMAP_DEMO_RUNNER pattern)
 DOS_HULK_DEMO_RUNNER = DosHulkDemoRunner()

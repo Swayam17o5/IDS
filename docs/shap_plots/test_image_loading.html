@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SHAP Image Loading Test</title>
+  <style>
+    body {
+      font-family: 'Courier New', monospace;
+      background: #1a1a2e;
+      color: #eee;
+      padding: 20px;
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+    .header {
+      border-bottom: 2px solid #16c784;
+      padding-bottom: 15px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0;
+      color: #00f0ff;
+    }
+    .test-item {
+      margin: 15px 0;
+      padding: 12px;
+      border-left: 4px solid #555;
+      background: rgba(255,255,255,0.05);
+    }
+    .test-item.success {
+      border-left-color: #16c784;
+      background: rgba(22, 199, 132, 0.1);
+    }
+    .test-item.error {
+      border-left-color: #ef4444;
+      background: rgba(239, 68, 68, 0.1);
+    }
+    .test-item.pending {
+      border-left-color: #f59e0b;
+      background: rgba(245, 158, 11, 0.1);
+    }
+    .status {
+      font-weight: bold;
+      margin: 5px 0;
+    }
+    .status.ok { color: #16c784; }
+    .status.fail { color: #ef4444; }
+    .status.wait { color: #f59e0b; }
+    .path-list {
+      font-size: 12px;
+      margin: 8px 0;
+      padding: 8px;
+      background: rgba(0,0,0,0.3);
+      border-radius: 4px;
+      color: #aaa;
+    }
+    .summary {
+      margin-top: 30px;
+      padding: 15px;
+      border: 2px solid #16c784;
+      border-radius: 6px;
+      background: rgba(22, 199, 132, 0.1);
+    }
+    .summary.failed {
+      border-color: #ef4444;
+      background: rgba(239, 68, 68, 0.1);
+    }
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: #333;
+      border-radius: 3px;
+      margin: 10px 0;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: #16c784;
+      width: 0%;
+      transition: width 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🔍 SHAP Image Loading Test Suite</h1>
+    <p>Diagnostic tool to verify all SHAP visualization images load correctly</p>
+  </div>
+
+  <div id="progress-container" style="margin-bottom: 20px;">
+    <div>Progress: <span id="progress-text">0/6</span></div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+  </div>
+
+  <div id="test-results"></div>
+
+  <div id="summary" style="display:none;"></div>
+
+  <script>
+    const IMAGES = [
+      {
+        name: "01_shap_beeswarm_global.png",
+        description: "Global SHAP Beeswarm Plot"
+      },
+      {
+        name: "02_shap_multiclass_bar.png",
+        description: "Multi-Class Stacked Feature Importance"
+      },
+      {
+        name: "03_shap_waterfall_attack_incident.png",
+        description: "Incident Forensic Waterfall Plot"
+      },
+      {
+        name: "04_shap_force_plot.png",
+        description: "Static SHAP Force Plot"
+      },
+      {
+        name: "05_shap_dependence_interaction.png",
+        description: "SHAP Dependence & Interaction Plot"
+      },
+      {
+        name: "06_shap_decision_attack_burst.png",
+        description: "Multi-Flow Decision Plot"
+      }
+    ];
+
+    const ASSET_PATHS = [
+      './',                    // Current directory
+      '../shap_plots/',        // From docs/ directory
+      './shap_plots/',         // From IDS/ root
+      '/docs/shap_plots/',     // From web server root
+    ];
+
+    const resultsContainer = document.getElementById('test-results');
+    let successCount = 0;
+    let failureCount = 0;
+
+    async function testImage(image, index) {
+      const testDiv = document.createElement('div');
+      testDiv.className = 'test-item pending';
+      testDiv.innerHTML = `
+        <div style="display: flex; justify-content: space-between;">
+          <div>
+            <strong>${index + 1}. ${image.description}</strong>
+            <div style="font-size: 12px; color: #aaa; margin-top: 4px;">File: <code>${image.name}</code></div>
+          </div>
+          <div class="status wait">TESTING...</div>
+        </div>
+        <div class="path-list" style="display:none;">Searching paths...</div>
+      `;
+      resultsContainer.appendChild(testDiv);
+
+      const statusDiv = testDiv.querySelector('.status');
+      const pathDiv = testDiv.querySelector('.path-list');
+
+      let foundPath = null;
+      const searchedPaths = [];
+
+      for (const basePath of ASSET_PATHS) {
+        const fullPath = basePath + image.name;
+        searchedPaths.push(fullPath);
+
+        try {
+          const response = await fetch(fullPath, { method: 'HEAD' });
+          if (response.ok) {
+            foundPath = fullPath;
+            break;
+          }
+        } catch (e) {
+          // Try next path
+        }
+      }
+
+      // Update UI
+      if (foundPath) {
+        testDiv.className = 'test-item success';
+        statusDiv.className = 'status ok';
+        statusDiv.textContent = `✓ FOUND at: ${foundPath}`;
+        successCount++;
+      } else {
+        testDiv.className = 'test-item error';
+        statusDiv.className = 'status fail';
+        statusDiv.textContent = '✗ NOT FOUND';
+        pathDiv.style.display = 'block';
+        pathDiv.innerHTML = `<strong>Searched paths:</strong><br/>` +
+          searchedPaths.map(p => `• ${p}`).join('<br/>');
+        failureCount++;
+      }
+
+      // Update progress
+      updateProgress();
+    }
+
+    function updateProgress() {
+      const total = successCount + failureCount;
+      const percent = (total / IMAGES.length) * 100;
+      document.getElementById('progress-text').textContent = `${total}/${IMAGES.length}`;
+      document.getElementById('progress-fill').style.width = percent + '%';
+
+      if (total === IMAGES.length) {
+        showSummary();
+      }
+    }
+
+    function showSummary() {
+      const summaryDiv = document.getElementById('summary');
+      summaryDiv.style.display = 'block';
+
+      const allSuccess = failureCount === 0;
+      summaryDiv.className = allSuccess ? 'summary' : 'summary failed';
+
+      if (allSuccess) {
+        summaryDiv.innerHTML = `
+          <h2>✓ All Tests Passed!</h2>
+          <p>All ${IMAGES.length} SHAP visualization images are accessible.</p>
+          <p><strong>The deep explain section should display all graphs correctly.</strong></p>
+          <p><a href="./index.html" style="color: #00f0ff; text-decoration: underline;">→ Open SHAP Gallery</a></p>
+        `;
+      } else {
+        summaryDiv.innerHTML = `
+          <h2>✗ ${failureCount} Image(s) Not Found</h2>
+          <p>Success: ${successCount}/${IMAGES.length}</p>
+          <p><strong>Troubleshooting:</strong></p>
+          <ul>
+            <li>Ensure PNG files exist in the correct directory</li>
+            <li>Check file permissions</li>
+            <li>Try opening this test from different locations:
+              <ul>
+                <li><code>file:///c:/Major%20Project/IDS/docs/shap_plots/test_image_loading.html</code></li>
+                <li>Via local web server: <code>http://localhost:8000/docs/shap_plots/test_image_loading.html</code></li>
+              </ul>
+            </li>
+            <li>Check browser console (F12) for detailed error messages</li>
+          </ul>
+        `;
+      }
+    }
+
+    // Run tests
+    async function runTests() {
+      for (let i = 0; i < IMAGES.length; i++) {
+        await testImage(IMAGES[i], i);
+        // Small delay between tests for visual effect
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+
+    // Start tests on load
+    window.addEventListener('DOMContentLoaded', runTests);
+  </script>
+</body>
+</html>

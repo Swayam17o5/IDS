@@ -12,6 +12,9 @@ EXPLAINABILITY_HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <title>AegisNIDS // AI Explainability & Alert Analysis</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -386,6 +389,100 @@ EXPLAINABILITY_HTML = """
       color: var(--text-muted);
       font-size: 14px;
     }
+
+    /* SHAP Plot Block Components */
+    .shap-plot-block {
+      background: rgba(0,0,0,0.35);
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      padding: 20px;
+      margin-bottom: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .shap-plot-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .shap-plot-title {
+      font-weight: 700;
+      font-size: 15px;
+      color: #fff;
+    }
+    .shap-plot-tag {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      background: rgba(255,255,255,0.05);
+      padding: 3px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--card-border);
+    }
+    .shap-img-wrap {
+      background: rgba(255,255,255,0.02);
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      overflow-x: auto;  /* Enable horizontal scrolling for wide images */
+      overflow-y: hidden;
+      min-height: 80px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;  /* Align to start so scroll works */
+      text-align: center;
+      padding: 10px;
+    }
+    .shap-img-loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      padding: 28px 20px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .shap-spinner {
+      width: 28px;
+      height: 28px;
+      border: 3px solid rgba(0, 240, 255, 0.2);
+      border-top-color: var(--accent-cyan);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .shap-plot-img {
+      width: auto;  /* Don't force width - use natural image size */
+      max-width: none;  /* Remove max constraint */
+      height: auto;
+      border-radius: 6px;
+      background: #ffffff;
+      padding: 6px;
+      display: block;
+    }
+    .shap-plot-desc {
+      font-size: 12.5px;
+      color: var(--text-muted);
+      line-height: 1.6;
+      background: rgba(255,255,255,0.03);
+      padding: 12px 16px;
+      border-radius: 6px;
+    }
+    .shap-plot-error {
+      padding: 20px;
+      color: var(--text-muted);
+      font-size: 12px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .shap-plot-error-icon { font-size: 22px; }
   </style>
 </head>
 <body>
@@ -545,6 +642,10 @@ NETWORK WIRE FRAME ──► 77-FEATURE VECTOR EXTRACTION ──► FEATURE VALI
         </div>
       </div>
 
+      <!-- SECTION 4B: VISUAL SHAP FORENSIC GRAPHS -->
+      <div class="card" style="border: 1px solid rgba(0, 240, 255, 0.4); background: linear-gradient(135deg, rgba(15,23,42,0.92) 0%, rgba(0,240,255,0.06) 100%);">
+        <div class="card-title" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+         
       <!-- SECTION 5: BEHAVIORAL DETECTION ANALYSIS -->
       <div class="card" id="behavioral-card">
         <div class="card-title" style="color: var(--medium);">⚡ Behavioral Heuristic Evidence Analysis</div>
@@ -611,9 +712,19 @@ NETWORK WIRE FRAME ──► 77-FEATURE VECTOR EXTRACTION ──► FEATURE VALI
       <!-- SECTION 8: GLOBAL MODEL EXPLAINABILITY -->
       <div class="card">
         <div class="card-title">🌐 Global Model Explainability (Dataset Level)</div>
-        <p style="font-size: 13px; color: var(--text-muted);">
-          Key discriminating features across the entire CICIDS2017 training benchmark for the active architecture:
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+          Key discriminating features and global decision boundaries across the entire CICIDS2017 benchmark:
         </p>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 16px; margin-bottom: 16px;">
+          <div style="background: rgba(0,0,0,0.3); border-radius: 8px; border: 1px solid var(--card-border); padding: 14px; text-align: center;">
+            <div style="font-weight: 700; font-size: 13px; color: #fff; margin-bottom: 8px; text-align: left;">🐝 Global SHAP Beeswarm Summary Plot</div>
+            <img src="/shap-gallery/static/01_shap_beeswarm_global.png" alt="Global Beeswarm" style="width: 100%; border-radius: 6px; background: #ffffff; padding: 8px;">
+          </div>
+          <div style="background: rgba(0,0,0,0.3); border-radius: 8px; border: 1px solid var(--card-border); padding: 14px; text-align: center;">
+            <div style="font-weight: 700; font-size: 13px; color: #fff; margin-bottom: 8px; text-align: left;">📊 Multi-Class Stacked Feature Importance</div>
+            <img src="/shap-gallery/static/02_shap_multiclass_bar.png" alt="Multi-Class Stacked" style="width: 100%; border-radius: 6px; background: #ffffff; padding: 8px;">
+          </div>
+        </div>
         <div id="global-importance-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 4px;">
           <!-- Dynamically populated -->
         </div>
@@ -623,6 +734,39 @@ NETWORK WIRE FRAME ──► 77-FEATURE VECTOR EXTRACTION ──► FEATURE VALI
   </main>
 
   <script>
+    // Define helper functions FIRST, before they're needed by inline event handlers
+    
+    // Show a successfully loaded SHAP plot image and hide its loading spinner
+    function showPlot(name) {
+      const loadEl = document.getElementById('load-' + name);
+      const imgEl = document.getElementById('img-shap-' + name);
+      const wrapEl = document.getElementById('wrap-' + name);
+      if (loadEl) loadEl.style.display = 'none';
+      if (imgEl) {
+        imgEl.style.display = 'block';
+        if (wrapEl) wrapEl.style.justifyContent = 'flex-start';
+      }
+    }
+
+    // Show error state for a SHAP plot that failed to load
+    function showPlotError(name, message) {
+      const loadEl = document.getElementById('load-' + name);
+      const imgEl = document.getElementById('img-shap-' + name);
+      const wrapEl = document.getElementById('wrap-' + name);
+      console.error('SHAP plot load failed:', name, 'URL was:', imgEl ? imgEl.src : 'unknown');
+      if (loadEl) loadEl.style.display = 'none';
+      if (imgEl) imgEl.style.display = 'none';
+      if (wrapEl) {
+        wrapEl.innerHTML = `
+          <div class="shap-plot-error">
+            <div class="shap-plot-error-icon">📊</div>
+            <div style="color: var(--text-muted); font-size: 12px;">${message}</div>
+            <div style="font-size: 11px; color: var(--card-border);">Static fallback: check /shap-gallery for pre-computed global plots</div>
+          </div>`;
+      }
+    }
+
+    // Now declare variables and other code
     const alertId = window.location.pathname.split('/').pop();
     let deepData = null;
     let allFeaturesList = [];
@@ -720,6 +864,24 @@ NETWORK WIRE FRAME ──► 77-FEATURE VECTOR EXTRACTION ──► FEATURE VALI
 
       // Global Importance
       renderGlobalImportance(data.global_shap || []);
+
+      // Load all 4 visual SHAP graphs (removed Force plot)
+      const aid = alert.alert_id || alertId;
+      const cacheBust = new Date().getTime();
+      const shapPlots = [
+        { imgId: 'img-shap-waterfall', url: `/api/alerts/${aid}/waterfall.png?t=${cacheBust}` },
+        { imgId: 'img-shap-bar',       url: `/api/alerts/${aid}/bar-plot.png?t=${cacheBust}` },
+        { imgId: 'img-shap-decision',  url: `/api/alerts/${aid}/decision-plot.png?t=${cacheBust}` },
+        { imgId: 'img-shap-beeswarm', url: `/api/alerts/${aid}/beeswarm-plot.png?t=${cacheBust}` },
+      ];
+      console.log('Loading SHAP plots for alert:', aid, 'with cache bust:', cacheBust);
+      shapPlots.forEach(p => {
+        const img = document.getElementById(p.imgId);
+        if (img) {
+          console.log('Setting image src:', p.url);
+          img.src = p.url;
+        }
+      });
     }
 
     function renderProbabilities(probs) {

@@ -23,11 +23,58 @@ venv.bak/
 # Logs
 *.log
 
-# Database temporary files
+# Database files
+*.db
 *.db-shm
 *.db-wal
+database/*.db
+nids.db
 
-# Scratch PCAPs
+# Large CSV datasets
+*.csv
+*pcap_ISCX.csv
+
+# Test files
+test_*.py
+test_*.png
+test_*.txt
+
+# Scratch directory
+scratch/
+
+# Analysis and diagnostic files
+*_output.txt
+*_results.json
+*_report.json
+forensics_*.txt
+trace_*.txt
+diagnose_*.txt
+
+# Temporary analysis scripts
+analyze_*.py
+compare_*.py
+debug_*.py
+diagnose_*.py
+extract_*.py
+validate_*.py
+verify_*.py
+investigate_*.py
+trace_*.py
+
+# Backup files
+*.backup
+*_backup.py
+*_v1_backup.py
+
+# Report files
+*.md
+!README.md
+!docs/**/*.md
+*.txt
+!requirements.txt
+
+# PCAP files
+*.pcap
 scratch/*.pcap
 
 # OS generated files
